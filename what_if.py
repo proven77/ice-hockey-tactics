@@ -1,8 +1,9 @@
 import argparse
 import csv
 import json
+from dataclasses import dataclass
 from pathlib import Path
-from time import monotonic, sleep
+from time import monotonic, perf_counter, sleep
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -46,45 +47,94 @@ def mask_from_polygons(shape, polygons):
     return mask
 
 
-def build_edit(frame, config, rink_size):
+@dataclass
+class PreparedPlayer:
+    image_to_ice: np.ndarray
+    ice_to_image: np.ndarray
+    source_px: np.ndarray
+    source_m: np.ndarray
+    repair: np.ndarray
+    protected: np.ndarray
+    origin_px: np.ndarray
+    alpha: np.ndarray
+    foreground: np.ndarray
+
+
+@dataclass
+class Placement:
+    target_m: np.ndarray
+    target_px: np.ndarray
+    scale: float
+    applied_foot_px: np.ndarray
+    transform: np.ndarray
+    region: tuple
+    alpha: np.ndarray
+    shadow: np.ndarray
+
+
+def prepare_player(frame, config):
     image_to_ice = np.asarray(config["image_to_ice"], dtype=float)
     if image_to_ice.shape != (3, 3) or not np.isfinite(image_to_ice).all() or np.linalg.matrix_rank(image_to_ice) < 3:
         raise ValueError("Expected a valid 3 x 3 image-to-ice matrix")
     height, width = frame.shape[:2]
     source_px = np.asarray(config["source_foot_px"], dtype=float)
-    target_m = np.asarray(config["target_m"], dtype=float)
     if source_px.shape != (2,) or not np.isfinite(source_px).all() or (source_px < 0).any() or (source_px >= [width, height]).any():
         raise ValueError("Source skate anchor is outside the frame")
-    if target_m.shape != (2,) or not np.isfinite(target_m).all() or (target_m < 0).any() or (target_m > rink_size).any():
-        raise ValueError("Target is outside the rink")
-
     source_m = project(image_to_ice, source_px)
     ice_to_image = np.linalg.inv(image_to_ice)
-    target_px = project(ice_to_image, target_m)
-    if (target_px < 0).any() or (target_px >= [width, height]).any():
-        raise ValueError("The target skate anchor is outside the camera view")
-    # The projective denominator gives a local scale approximation for a short move.
-    scale = float((ice_to_image[2] @ [*source_m, 1.0]) / (ice_to_image[2] @ [*target_m, 1.0]))
-    if not 0.75 <= scale <= 1.30:
-        raise ValueError("Target requires a larger perspective change than this 2D edit supports")
-    transform = np.column_stack((np.eye(2) * scale, target_px - scale * source_px))
-
     player = mask_from_polygons((height, width), config["player_polygons_px"])
     if not np.any(player):
         raise ValueError("Player mask is empty")
     x, y, w, h = cv2.boundingRect(player)
-    corners = np.array([[x, y], [x + w - 1, y + h - 1]]) * scale + transform[:, 2]
+    # Leave room for the feather entirely outside the player and stick silhouette.
+    repair = cv2.dilate(player, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35)))
+    shadow = mask_from_polygons((height, width), config.get("shadow_polygons_px", []))
+    repair = cv2.bitwise_or(repair, shadow)
+    protected = mask_from_polygons((height, width), config.get("protected_polygons_px", [])) > 0
+    if np.any((repair > 0) & protected):
+        raise ValueError("Source repair intersects a protected object")
+    # Keep a one-pixel transparent border for bilinear sampling at the edges.
+    left, top = max(0, x - 1), max(0, y - 1)
+    crop = np.s_[top:y + h + 1, left:x + w + 1]
+    alpha = player[crop].copy()
+    foreground = frame[crop].astype(np.float32) * (alpha[..., None].astype(np.float32) / 255)
+    return PreparedPlayer(image_to_ice, ice_to_image, source_px, source_m, repair, protected,
+                          np.array([left, top]), alpha, foreground)
+
+
+def place_player(player, target, rink_size):
+    height, width = player.repair.shape
+    target_m = np.asarray(target, dtype=float)
+    if target_m.shape != (2,) or not np.isfinite(target_m).all() or (target_m < 0).any() or (target_m > rink_size).any():
+        raise ValueError("Target is outside the rink")
+    target_px = project(player.ice_to_image, target_m)
+    if (target_px < 0).any() or (target_px >= [width, height]).any():
+        raise ValueError("The target skate anchor is outside the camera view")
+    # The projective denominator gives a local scale approximation for a short move.
+    depth = player.ice_to_image[2]
+    scale = float((depth @ [*player.source_m, 1.0]) / (depth @ [*target_m, 1.0]))
+    if not 0.75 <= scale <= 1.30:
+        raise ValueError("Target requires a larger perspective change than this 2D edit supports")
+    offset = target_px - scale * player.source_px
+    x, y, w, h = cv2.boundingRect(player.alpha)
+    corners = (np.array([[x, y], [x + w - 1, y + h - 1]]) + player.origin_px) * scale + offset
     if (corners < 0).any() or (corners >= [width, height]).any():
         raise ValueError("The relocated player would be cut off by the frame")
-    # Leave room for the feather entirely outside the player and stick silhouette.
-    original = cv2.dilate(player, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35)))
-    shadow = mask_from_polygons((height, width), config.get("shadow_polygons_px", []))
-    original = cv2.bitwise_or(original, shadow)
-    relocated = cv2.warpAffine(player, transform, (width, height), flags=cv2.INTER_LINEAR)
-    protected = mask_from_polygons((height, width), config.get("protected_polygons_px", []))
-    if np.any((protected > 0) & ((original > 0) | (relocated > 0))):
+
+    # Cover the transformed cutout and the full support of the blurred skate shadow.
+    start = np.maximum(0, np.floor(np.minimum(corners[0] - 2, target_px - 56)).astype(int))
+    end = np.minimum([width, height], np.ceil(np.maximum(corners[1] + 3, target_px + 56)).astype(int))
+    region = np.s_[start[1]:end[1], start[0]:end[0]]
+    size = tuple(end - start)
+    transform = np.column_stack((np.eye(2) * scale, scale * player.origin_px + offset - start))
+    alpha = cv2.warpAffine(player.alpha, transform, size, flags=cv2.INTER_LINEAR)
+    shadow = contact_shadow(size[::-1], target_px - start, scale)
+    if np.any(player.protected[region] & (alpha > 0)):
         raise ValueError("Edit intersects a protected object")
-    return source_m, target_m, target_px, scale, transform, player, original, relocated
+    if np.any(player.protected[region] & (shadow > 0)):
+        raise ValueError("Contact shadow intersects a protected object")
+    applied_foot_px = transform @ [*(player.source_px - player.origin_px), 1] + start
+    return Placement(target_m, target_px, scale, applied_foot_px, transform, region, alpha, shadow)
 
 
 def contact_shadow(shape, foot_px, scale):
@@ -177,14 +227,14 @@ def comfy_repair(frame, mask, session, url, output, seed):
     raise ValueError(f"ComfyUI prompt {prompt_id} did not finish within 15 minutes")
 
 
-def composite(frame, background, transform, player, relocated, shadow):
-    # Premultiplied alpha avoids carrying ice-coloured fringes to the new location.
-    height, width = frame.shape[:2]
-    foreground = frame.astype(np.float32) * (player[..., None] / 255)
-    moved = cv2.warpAffine(foreground, transform, (width, height), flags=cv2.INTER_LINEAR)
-    alpha = relocated[..., None] / 255
-    background = background * (1 - shadow[..., None] / 255)
-    return np.rint(moved + background * (1 - alpha)).clip(0, 255).astype(np.uint8)
+def composite(background, player, placement):
+    moved = cv2.warpAffine(player.foreground, placement.transform, placement.alpha.shape[::-1], flags=cv2.INTER_LINEAR)
+    alpha = placement.alpha[..., None].astype(np.float32) / 255
+    shadow = placement.shadow[..., None].astype(np.float32) / 255
+    patch = moved + background[placement.region] * (1 - shadow) * (1 - alpha)
+    edited = background.copy()
+    edited[placement.region] = np.rint(patch).clip(0, 255).astype(np.uint8)
+    return edited
 
 
 def write_animation(path, config, rink_size, source_m, target_m):
@@ -229,13 +279,46 @@ def comparison(original, edited, index, output):
     for label, panel in zip((f"ORIGINAL  /  FRAME {index}", "WHAT-IF  /  RELOCATED PLAYER"), panels):
         cv2.rectangle(panel, (0, 0), (800, 34), (27, 24, 19), -1)
         cv2.putText(panel, label, (16, 23), 0, 0.54, (245, 241, 230), 1, cv2.LINE_AA)
-    cv2.imwrite(str(output), cv2.hconcat(panels))
+    write_png(output, cv2.hconcat(panels))
+
+
+def write_png(path, image):
+    if not cv2.imwrite(str(path), image):
+        raise OSError(f"Could not write {path}")
+
+
+def render_placement(frame, background, player, placement, config, rink_size, output):
+    started = perf_counter()
+    edited = composite(background, player, placement)
+    composite_ms = (perf_counter() - started) * 1000
+    allowed = player.repair > 0
+    allowed[placement.region] |= (placement.alpha > 0) | (placement.shadow > 0)
+    changed = np.any(edited != frame, axis=2)
+    outside_changes = int(np.count_nonzero(changed & ~allowed))
+    if outside_changes:
+        raise ValueError("Pixels outside the edit mask changed")
+    write_png(output / "edit-mask.png", allowed.astype(np.uint8) * 255)
+    write_png(output / "what-if.png", edited)
+    comparison(frame, edited, config["frame"], output / "comparison.png")
+    write_animation(output / "tactical-path.mp4", config, rink_size, player.source_m, placement.target_m)
+    actual_px = placement.applied_foot_px
+    error = float(np.linalg.norm(project(player.image_to_ice, actual_px) - placement.target_m))
+    return {
+        "target_m": placement.target_m.tolist(), "target_foot_px": placement.target_px.tolist(),
+        "applied_foot_px": actual_px.tolist(), "anchor_roundtrip_error_m": error,
+        "distance_m": float(np.linalg.norm(placement.target_m - player.source_m)),
+        "player_scale": placement.scale, "outside_mask_changed_pixels": outside_changes,
+        "changed_pixels": int(np.count_nonzero(changed)), "composite_ms": round(composite_ms, 2),
+        "animation_fps": 30, "animation_frames": 90,
+    }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Render a single hockey What-If edit and tactical trajectory.")
+    parser = argparse.ArgumentParser(description="Render hockey What-If edits using one repair per selected player.")
     parser.add_argument("case", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--target", nargs=2, type=float, action="append", metavar=("X_M", "Y_M"),
+                        help="Override the case target in ice metres. Repeat to reuse the repair across targets.")
     parser.add_argument("--comfy-url", default="http://127.0.0.1:8191")
     parser.add_argument("--seed", type=int, default=103)
     args = parser.parse_args()
@@ -248,38 +331,37 @@ def main():
         config = json.loads(args.case.read_text(encoding="utf-8"))
         frame = rink_frame(ROOT / config["video"], config["frame"])
         rink_size = TacticalViewConverter(RINK).size_m
-        source_m, target_m, target_px, scale, transform, player, repair, relocated = build_edit(frame, config, rink_size)
-        shadow = contact_shadow(frame.shape[:2], target_px, scale)
-        protected = mask_from_polygons(frame.shape[:2], config.get("protected_polygons_px", []))
-        if np.any((shadow > 0) & (protected > 0)):
-            raise ValueError("Contact shadow intersects a protected object")
+        player = prepare_player(frame, config)
+        targets = args.target if args.target else [config["target_m"]]
+        placements = []
+        for index, target in enumerate(targets, 1):
+            try:
+                placements.append(place_player(player, target, rink_size))
+            except ValueError as exc:
+                raise ValueError(f"Target {index} {target}: {exc}") from exc
         args.output.mkdir(parents=True, exist_ok=False)
-        cv2.imwrite(str(args.output / "original.png"), frame)
-        allowed = (repair > 0) | (relocated > 0) | (shadow > 0)
-        cv2.imwrite(str(args.output / "edit-mask.png"), allowed.astype(np.uint8) * 255)
-        write_animation(args.output / "tactical-path.mp4", config, rink_size, source_m, target_m)
+        write_png(args.output / "original.png", frame)
         with requests.Session() as session:
             session.trust_env = False
             started = monotonic()
-            background, prompt_id = comfy_repair(frame, repair, session, url, args.output, args.seed)
-        edited = composite(frame, background, transform, player, relocated, shadow)
-        changed = np.any(edited != frame, axis=2)
-        outside_changes = int(np.count_nonzero(changed & ~allowed))
-        if outside_changes:
-            raise ValueError("Pixels outside the edit mask changed")
-        cv2.imwrite(str(args.output / "what-if.png"), edited)
-        comparison(frame, edited, config["frame"], args.output / "comparison.png")
-        actual_px = transform @ [*config["source_foot_px"], 1]
-        error = float(np.linalg.norm(project(np.asarray(config["image_to_ice"]), actual_px) - target_m))
+            background, prompt_id = comfy_repair(frame, player.repair, session, url, args.output, args.seed)
+        repair_seconds = round(monotonic() - started, 1)
+        write_png(args.output / "repaired-background.png", background)
+        write_png(args.output / "repair-mask.png", player.repair)
         report = {
             "source_video": config["video"], "source_frame": config["frame"], "track_id": config["track_id"],
-            "calibration_inliers": config.get("calibration_inliers"), "source_m": source_m.tolist(),
-            "target_m": target_m.tolist(), "target_foot_px": target_px.tolist(), "applied_foot_px": actual_px.tolist(),
-            "anchor_roundtrip_error_m": error, "player_scale": scale, "outside_mask_changed_pixels": outside_changes,
-            "changed_pixels": int(np.count_nonzero(changed)), "comfy_prompt_id": prompt_id,
-            "comfy_seconds": round(monotonic() - started, 1), "seed": args.seed,
-            "animation_fps": 30, "animation_frames": 90,
+            "calibration_inliers": config.get("calibration_inliers"), "source_m": player.source_m.tolist(),
+            "comfy_prompt_id": prompt_id, "comfy_seconds": repair_seconds, "seed": args.seed,
         }
+        if len(placements) == 1:
+            report.update(render_placement(frame, background, player, placements[0], config, rink_size, args.output))
+        else:
+            report["placements"] = []
+            for index, placement in enumerate(placements, 1):
+                output = args.output / f"target-{index:02d}"
+                output.mkdir()
+                result = render_placement(frame, background, player, placement, config, rink_size, output)
+                report["placements"].append({"directory": output.name, **result})
         (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(report, indent=2))
     except (KeyError, ValueError, OSError, requests.RequestException) as exc:

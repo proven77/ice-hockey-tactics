@@ -27,6 +27,14 @@ if (-not (Test-Path 'output-videos/snapshot-cv-rink640/tracks.csv')) {
 & $cvPy what_if.py what_if_case.json --output output-videos/whatif-local-run
 ```
 
+同一關鍵幀要比較多個落點時，重複傳入 `--target X_M Y_M`。程式先檢查每個落點，再送出一次 ComfyUI 修補。所有結果共用同一張 `repaired-background.png` 與同一份原球員裁切，各落點輸出在 `target-01`、`target-02` 等子目錄。省略 `--target` 時沿用案例 JSON 的落點及單一目錄輸出。
+
+```powershell
+& $cvPy what_if.py what_if_case.json --output output-videos/whatif-defense-step1 `
+    --target 44.65 15.82 --target 40.8 14.8 --target 45 13
+& $cvPy -m unittest -v test_tactics test_what_if
+```
+
 ## 處理流程
 
 1. `what_if_case.json` 記錄這一幀的冰場單應性矩陣、冰刀錨點、球員與球桿輪廓、陰影和鄰近球員保護範圍。先用反單應性矩陣把目標冰面座標轉成畫面上的冰刀落點，再依目標位置的局部透視比例縮放原人物裁切。這個矩陣與輪廓只適用於此畫面，切換關鍵幀時要重新校正與標註。
@@ -40,6 +48,7 @@ if (-not (Test-Path 'output-videos/snapshot-cv-rink640/tracks.csv')) {
 | --- | --- |
 | `what-if.png`、`original.png` | 原始解析度的結果圖與原圖 |
 | `comparison.png` | 左右並排預覽 |
+| `repaired-background.png`、`repair-mask.png` | 一次修補產生的共用背景與原位置修補遮罩 |
 | `tactical-path.mp4` | 30 fps、90 幀的戰術板動畫 |
 | `edit-mask.png` | 白色為允許修改的像素 |
 | `report.json` | 移動前後座標、合成錨點、遮罩外變更像素數與 ComfyUI 工作 ID |
@@ -52,6 +61,20 @@ if (-not (Test-Path 'output-videos/snapshot-cv-rink640/tracks.csv')) {
 最終結果位於 `output-videos/whatif-final`。冰刀落點約為 `(1141.41, 519.74)` px。放大原位置檢查，已移除球員與球桿輪廓，修補區仍有輕微冰面色調變化。原圖與結果圖均為 1920 × 1080，逐像素比對後，41,452 個變更像素皆在 `edit-mask.png` 白色範圍內。戰術板 MP4 完整解碼得到 90 幀。
 
 同一台機器的一次冷啟動測得約 301 秒，權重已載入後的下一次修補約 14 秒。兩筆時間來自個別執行結果。
+
+### 防守實驗 1
+
+第 150 幀的追蹤 ID 4 使用一次本機 ComfyUI 修補，三張原尺寸結果均重用同一份修補背景。本次冷啟動到背景就緒為 325.0 秒，結果在 `output-videos/whatif-defense-step1`。
+
+| 指定冰面座標（公尺） | 位移（公尺） | 合成冰刀錨點（px） | 遮罩外變更像素 |
+| --- | ---: | --- | ---: |
+| `(44.65, 15.82)` | 2.23 | `(1141.41, 519.74)` | 0 |
+| `(40.80, 14.80)` | 1.91 | `(750.53, 532.70)` | 0 |
+| `(45.00, 13.00)` | 3.82 | `(1048.60, 452.90)` | 0 |
+
+逐張解碼 PNG 並核對指定落點、保護區及遮罩外像素。三支戰術板 MP4 均解碼出 90 幀。相鄰球員重疊、人物裁切及冰刀錨點出畫三種案例各回報原因，且於提交修補前被拒絕。局部放大可見人物與球桿輪廓已清除，原冰面區域仍有輕微色差。定位檢查使用同一組冰場矩陣，尚未量測與真實冰場的定位偏差。
+
+修補就緒後，以三個落點循環測試，暖身 3 次後採樣 60 次。落點檢查加局部合成 p50 為 4.08 ms、p95 為 5.69 ms。計入 1080p PNG 編碼後 p95 為 57.57 ms。這組數據採高解析度計時器，量測後端處理，介面、磁碟寫入及影片匯出耗時另計。
 
 下一步的關鍵幀、封堵規則與驗收條件見 [封堵射門線實作計畫](TACTICS_SHOT_LANE_PLAN.md)。
 
