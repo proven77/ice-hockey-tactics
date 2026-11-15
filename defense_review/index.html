@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>冰球防守復盤</title>
+  <link rel="stylesheet" href="/review.css">
+  <script type="module" src="/review.js"></script>
+</head>
+<body>
+<main>
+  <header class="page-head">
+    <h1>冰球防守復盤</h1>
+    <div class="frames" aria-label="來源畫面">
+      <button id="reference" aria-pressed="false">前一幀</button>
+      <button id="keyframe" aria-pressed="true">關鍵幀</button>
+    </div>
+  </header>
+  <section class="workbench">
+    <article>
+      <div class="card-head">
+        <h2>戰術板</h2>
+        <button id="reset" disabled>還原原位</button>
+      </div>
+      <div id="board" aria-label="俯視冰場">
+        <img src="/rink.png" alt="">
+        <div id="tracks"></div>
+        <button id="defender" title="選取或拖曳防守球員 D1" aria-label="防守球員 D1" aria-pressed="false" disabled>D1</button>
+      </div>
+      <div class="info">
+        <p id="position">載入冰場資料中</p>
+        <p id="hint">拖曳 D1 到新站位，或選取後用方向鍵微調並按 Enter 套用。</p>
+      </div>
+    </article>
+    <article>
+      <div class="card-head">
+        <h2 id="shot-title">原鏡頭</h2>
+        <label class="toggle"><input type="checkbox" id="markers" checked> 顯示 D1 標記</label>
+      </div>
+      <canvas id="shot" aria-label="原始或 What-If 轉播畫面"></canvas>
+      <div class="info">
+        <p id="status" role="status" aria-live="polite">載入案例中</p>
+        <button id="retry" hidden>重試修補</button>
+      </div>
+    </article>
+  </section>
+  <section class="output" aria-label="結果與匯出">
+    <div class="result-tabs" aria-label="比較畫面">
+      <button id="original" aria-pressed="true">原圖</button>
+      <button id="result" aria-pressed="false" disabled>What-If</button>
+    </div>
+    <div class="exports">
+      <button id="save-clean" disabled>乾淨圖 PNG</button>
+      <button id="save-annotated" disabled>分析圖 PNG</button>
+      <button id="save-report" disabled>座標報告</button>
+    </div>
+  </section>
+</main>
+</body>
+</html>

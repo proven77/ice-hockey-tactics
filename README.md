@@ -4,6 +4,8 @@
 
 本機 ComfyUI 修補與 What-If 戰術板動畫的重現步驟見 [TACTICS_WHAT_IF.md](TACTICS_WHAT_IF.md)。
 
+[防守復盤介面](TACTICS_WHAT_IF.md#防守實驗-2)支援在固定關鍵幀拖曳 `D1`、比較影像及匯出結果。
+
 [防守復盤計畫](TACTICS_DEFENSE_PLAN.md)涵蓋拖曳、影像更新和球員標記。[封堵射門線計畫](TACTICS_SHOT_LANE_PLAN.md)記錄關鍵幀與量測驗收方式。
 
 本專案以 [SnapShot](https://github.com/danielrzhang/SnapShot/tree/ccfc904c51643b95fce7e3b0c0305df4a331e2ee) 為基礎，保留 [GPL-3.0 授權](LICENSE)。以下為上游專案介紹。

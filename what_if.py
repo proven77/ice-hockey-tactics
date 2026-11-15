@@ -1,6 +1,8 @@
 import argparse
 import csv
 import json
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic, perf_counter, sleep
@@ -177,12 +179,66 @@ def comfy_repair(frame, mask, session, url, output, seed):
         result = response.json()
         uploaded.append(f"{result['subfolder']}/{result['name']}")
 
-    graph = {
+    graph = repair_workflow(*uploaded, folder + "/repair", seed)
+    (output / "comfy-workflow-api.json").write_text(json.dumps(graph, indent=2), encoding="utf-8")
+    response = session.post(f"{url}/prompt", json={"prompt": graph}, timeout=30)
+    if not response.ok:
+        raise ValueError(f"ComfyUI rejected the graph: {response.text}")
+    prompt_id = response.json()["prompt_id"]
+    print(f"ComfyUI prompt: {prompt_id}", flush=True)
+    deadline = monotonic() + 900
+    try:
+        while monotonic() < deadline:
+            response = session.get(f"{url}/history/{prompt_id}", timeout=15)
+            response.raise_for_status()
+            history = response.json().get(prompt_id)
+            if history:
+                if history["status"]["status_str"] != "success":
+                    (output / "comfy-error.json").write_text(json.dumps(history["status"], indent=2), encoding="utf-8")
+                    _, failure = history["status"]["messages"][-1]
+                    raise ValueError(f"ComfyUI {failure.get('node_type', 'job')} failed: {failure.get('exception_message', prompt_id)}")
+                image = history["outputs"]["13"]["images"][0]
+                response = session.get(f"{url}/view", params=image, timeout=30)
+                response.raise_for_status()
+                repaired = cv2.imdecode(np.frombuffer(response.content, np.uint8), cv2.IMREAD_COLOR)
+                if repaired is None:
+                    raise ValueError("Could not decode ComfyUI output")
+                cv2.imwrite(str(output / "comfy-repair.png"), repaired)
+                result = frame.copy()
+                restored = cv2.resize(repaired, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_AREA).astype(np.float32)
+                texture = restored - cv2.GaussianBlur(restored, (0, 0), 8)
+                restored = (ice_color + texture.clip(-8, 8)).clip(0, 255)
+                feather = np.minimum(cv2.distanceTransform(crop_mask, cv2.DIST_L2, 3) / 12, 1)[..., None]
+                result[region] = np.rint(restored * feather + crop * (1 - feather)).astype(np.uint8)
+                return result, prompt_id
+            sleep(1)
+    except requests.RequestException as exc:
+        raise ValueError(
+            f"ComfyUI connection was lost while prompt {prompt_id} was running. "
+            "Check that ComfyUI is still running, then rerun the command. "
+            f"Details: {exc}"
+        ) from exc
+    raise ValueError(f"ComfyUI prompt {prompt_id} did not finish within 15 minutes")
+
+
+def check_comfy_ready(session, url):
+    try:
+        response = session.get(f"{url}/system_stats", timeout=5)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise ValueError(
+            f"Cannot connect to ComfyUI at {url}. Start ComfyUI, wait until its GUI/API is ready, "
+            f"then rerun this command. Details: {exc}"
+        ) from exc
+
+
+def repair_workflow(ice_input, mask_input, output_prefix, seed):
+    return {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "z_image_turbo_bf16.safetensors", "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_3_4b.safetensors", "type": "lumina2", "device": "default"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
-        "4": {"class_type": "LoadImage", "inputs": {"image": uploaded[0]}},
-        "5": {"class_type": "LoadImageMask", "inputs": {"image": uploaded[1], "channel": "red"}},
+        "4": {"class_type": "LoadImage", "inputs": {"image": ice_input}},
+        "5": {"class_type": "LoadImageMask", "inputs": {"image": mask_input, "channel": "red"}},
         "6": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": "Empty smooth white ice surface of a hockey rink from a television broadcast, subtle pale blue-grey lighting, matching the surrounding clean ice, empty ice, no objects or people."}},
         "7": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["6", 0]}},
         "8": {"class_type": "VAEEncode", "inputs": {"pixels": ["4", 0], "vae": ["3", 0]}},
@@ -191,40 +247,8 @@ def comfy_repair(frame, mask, session, url, output, seed):
         "11": {"class_type": "KSampler", "inputs": {"model": ["10", 0], "positive": ["6", 0], "negative": ["7", 0],
                 "latent_image": ["9", 0], "seed": seed, "steps": 8, "cfg": 1.0, "sampler_name": "res_multistep", "scheduler": "simple", "denoise": 0.42}},
         "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}},
-        "13": {"class_type": "SaveImage", "inputs": {"images": ["12", 0], "filename_prefix": folder + "/repair"}},
+        "13": {"class_type": "SaveImage", "inputs": {"images": ["12", 0], "filename_prefix": output_prefix}},
     }
-    (output / "comfy-workflow-api.json").write_text(json.dumps(graph, indent=2), encoding="utf-8")
-    response = session.post(f"{url}/prompt", json={"prompt": graph}, timeout=30)
-    if not response.ok:
-        raise ValueError(f"ComfyUI rejected the graph: {response.text}")
-    prompt_id = response.json()["prompt_id"]
-    print(f"ComfyUI prompt: {prompt_id}", flush=True)
-    deadline = monotonic() + 900
-    while monotonic() < deadline:
-        response = session.get(f"{url}/history/{prompt_id}", timeout=15)
-        response.raise_for_status()
-        history = response.json().get(prompt_id)
-        if history:
-            if history["status"]["status_str"] != "success":
-                (output / "comfy-error.json").write_text(json.dumps(history["status"], indent=2), encoding="utf-8")
-                _, failure = history["status"]["messages"][-1]
-                raise ValueError(f"ComfyUI {failure.get('node_type', 'job')} failed: {failure.get('exception_message', prompt_id)}")
-            image = history["outputs"]["13"]["images"][0]
-            response = session.get(f"{url}/view", params=image, timeout=30)
-            response.raise_for_status()
-            repaired = cv2.imdecode(np.frombuffer(response.content, np.uint8), cv2.IMREAD_COLOR)
-            if repaired is None:
-                raise ValueError("Could not decode ComfyUI output")
-            cv2.imwrite(str(output / "comfy-repair.png"), repaired)
-            result = frame.copy()
-            restored = cv2.resize(repaired, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_AREA).astype(np.float32)
-            texture = restored - cv2.GaussianBlur(restored, (0, 0), 8)
-            restored = (ice_color + texture.clip(-8, 8)).clip(0, 255)
-            feather = np.minimum(cv2.distanceTransform(crop_mask, cv2.DIST_L2, 3) / 12, 1)[..., None]
-            result[region] = np.rint(restored * feather + crop * (1 - feather)).astype(np.uint8)
-            return result, prompt_id
-        sleep(1)
-    raise ValueError(f"ComfyUI prompt {prompt_id} did not finish within 15 minutes")
 
 
 def composite(background, player, placement):
@@ -287,30 +311,34 @@ def write_png(path, image):
         raise OSError(f"Could not write {path}")
 
 
-def render_placement(frame, background, player, placement, config, rink_size, output):
-    started = perf_counter()
-    edited = composite(background, player, placement)
-    composite_ms = (perf_counter() - started) * 1000
+def placement_report(frame, edited, player, placement):
     allowed = player.repair > 0
     allowed[placement.region] |= (placement.alpha > 0) | (placement.shadow > 0)
     changed = np.any(edited != frame, axis=2)
     outside_changes = int(np.count_nonzero(changed & ~allowed))
     if outside_changes:
         raise ValueError("Pixels outside the edit mask changed")
-    write_png(output / "edit-mask.png", allowed.astype(np.uint8) * 255)
-    write_png(output / "what-if.png", edited)
-    comparison(frame, edited, config["frame"], output / "comparison.png")
-    write_animation(output / "tactical-path.mp4", config, rink_size, player.source_m, placement.target_m)
     actual_px = placement.applied_foot_px
     error = float(np.linalg.norm(project(player.image_to_ice, actual_px) - placement.target_m))
-    return {
+    return allowed, {
         "target_m": placement.target_m.tolist(), "target_foot_px": placement.target_px.tolist(),
         "applied_foot_px": actual_px.tolist(), "anchor_roundtrip_error_m": error,
         "distance_m": float(np.linalg.norm(placement.target_m - player.source_m)),
         "player_scale": placement.scale, "outside_mask_changed_pixels": outside_changes,
-        "changed_pixels": int(np.count_nonzero(changed)), "composite_ms": round(composite_ms, 2),
-        "animation_fps": 30, "animation_frames": 90,
+        "changed_pixels": int(np.count_nonzero(changed)),
     }
+
+
+def render_placement(frame, background, player, placement, config, rink_size, output):
+    started = perf_counter()
+    edited = composite(background, player, placement)
+    composite_ms = (perf_counter() - started) * 1000
+    allowed, report = placement_report(frame, edited, player, placement)
+    write_png(output / "edit-mask.png", allowed.astype(np.uint8) * 255)
+    write_png(output / "what-if.png", edited)
+    comparison(frame, edited, config["frame"], output / "comparison.png")
+    write_animation(output / "tactical-path.mp4", config, rink_size, player.source_m, placement.target_m)
+    return {**report, "composite_ms": round(composite_ms, 2), "animation_fps": 30, "animation_frames": 90}
 
 
 def main():
@@ -322,12 +350,16 @@ def main():
     parser.add_argument("--comfy-url", default="http://127.0.0.1:8191")
     parser.add_argument("--seed", type=int, default=103)
     args = parser.parse_args()
+    args.output = args.output.resolve()
     url = args.comfy_url.rstrip("/")
     endpoint = urlsplit(url)
     if endpoint.scheme != "http" or endpoint.hostname not in ("127.0.0.1", "localhost") or endpoint.path or endpoint.query:
         parser.error("Use an HTTP URL for a local ComfyUI instance")
 
+    staging = None
     try:
+        if args.output.exists():
+            raise ValueError(f"Output already exists: {args.output}. Choose a new output path or move the previous run folder.")
         config = json.loads(args.case.read_text(encoding="utf-8"))
         frame = rink_frame(ROOT / config["video"], config["frame"])
         rink_size = TacticalViewConverter(RINK).size_m
@@ -339,33 +371,40 @@ def main():
                 placements.append(place_player(player, target, rink_size))
             except ValueError as exc:
                 raise ValueError(f"Target {index} {target}: {exc}") from exc
-        args.output.mkdir(parents=True, exist_ok=False)
-        write_png(args.output / "original.png", frame)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
         with requests.Session() as session:
             session.trust_env = False
+            check_comfy_ready(session, url)
+            staging = Path(tempfile.mkdtemp(prefix=f".{args.output.name}.tmp-", dir=args.output.parent))
+            write_png(staging / "original.png", frame)
             started = monotonic()
-            background, prompt_id = comfy_repair(frame, player.repair, session, url, args.output, args.seed)
+            background, prompt_id = comfy_repair(frame, player.repair, session, url, staging, args.seed)
         repair_seconds = round(monotonic() - started, 1)
-        write_png(args.output / "repaired-background.png", background)
-        write_png(args.output / "repair-mask.png", player.repair)
+        write_png(staging / "repaired-background.png", background)
+        write_png(staging / "repair-mask.png", player.repair)
         report = {
             "source_video": config["video"], "source_frame": config["frame"], "track_id": config["track_id"],
             "calibration_inliers": config.get("calibration_inliers"), "source_m": player.source_m.tolist(),
             "comfy_prompt_id": prompt_id, "comfy_seconds": repair_seconds, "seed": args.seed,
         }
         if len(placements) == 1:
-            report.update(render_placement(frame, background, player, placements[0], config, rink_size, args.output))
+            report.update(render_placement(frame, background, player, placements[0], config, rink_size, staging))
         else:
             report["placements"] = []
             for index, placement in enumerate(placements, 1):
-                output = args.output / f"target-{index:02d}"
+                output = staging / f"target-{index:02d}"
                 output.mkdir()
                 result = render_placement(frame, background, player, placement, config, rink_size, output)
                 report["placements"].append({"directory": output.name, **result})
-        (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        (staging / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        staging.rename(args.output)
+        staging = None
         print(json.dumps(report, indent=2))
     except (KeyError, ValueError, OSError, requests.RequestException) as exc:
-        parser.error(str(exc))
+        parser.exit(2, f"{parser.prog}: error: {exc}\n")
+    finally:
+        if staging is not None and staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 if __name__ == "__main__":

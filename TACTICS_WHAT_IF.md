@@ -27,6 +27,8 @@ if (-not (Test-Path 'output-videos/snapshot-cv-rink640/tracks.csv')) {
 & $cvPy what_if.py what_if_case.json --output output-videos/whatif-local-run
 ```
 
+程式會先確認本機 ComfyUI API 已就緒，再建立暫存輸出資料夾；全部結果完成後才移至 `--output` 指定的位置。若 ComfyUI 尚未啟動，會提示啟動方式且不建立輸出資料夾。若生成期間服務中斷，錯誤會列出 ComfyUI prompt ID，並清除未完成的暫存輸出；修復服務後可用原指令重跑。已存在的正式輸出資料夾不會被覆寫，需改用新路徑或先移動舊資料夾。
+
 同一關鍵幀要比較多個落點時，重複傳入 `--target X_M Y_M`。程式先檢查每個落點，再送出一次 ComfyUI 修補。所有結果共用同一張 `repaired-background.png` 與同一份原球員裁切，各落點輸出在 `target-01`、`target-02` 等子目錄。省略 `--target` 時沿用案例 JSON 的落點及單一目錄輸出。
 
 ```powershell
@@ -75,6 +77,22 @@ if (-not (Test-Path 'output-videos/snapshot-cv-rink640/tracks.csv')) {
 逐張解碼 PNG 並核對指定落點、保護區及遮罩外像素。三支戰術板 MP4 均解碼出 90 幀。相鄰球員重疊、人物裁切及冰刀錨點出畫三種案例各回報原因，且於提交修補前被拒絕。局部放大可見人物與球桿輪廓已清除，原冰面區域仍有輕微色差。定位檢查使用同一組冰場矩陣，尚未量測與真實冰場的定位偏差。
 
 修補就緒後，以三個落點循環測試，暖身 3 次後採樣 60 次。落點檢查加局部合成 p50 為 4.08 ms、p95 為 5.69 ms。計入 1080p PNG 編碼後 p95 為 57.57 ms。這組數據採高解析度計時器，量測後端處理，介面、磁碟寫入及影片匯出耗時另計。
+
+### 防守實驗 2
+
+在 repo 根目錄以 Windows `cv` 啟動復盤介面。若已完成實驗 1，可直接使用該次修補結果，本機瀏覽器開啟 `http://127.0.0.1:8765`。
+
+```powershell
+$cvPy = Join-Path $env:USERPROFILE 'anaconda3\envs\cv\python.exe'
+& $cvPy defense_review.py --repair-run output-videos/whatif-defense-step1
+```
+
+若需要新修補，先依前段指令啟動 ComfyUI 並等它就緒，再執行 `& $cvPy defense_review.py`。選取 `D1` 會提交一次修補。同一頁切換參考幀或重新拖曳時可重用已完成的背景。若本機服務尚未啟動而出現失敗提示，啟動後按「重試修補」。
+
+- 第 150 幀可選取或拖曳 `D1`。也可用方向鍵移動，每次 0.2 公尺，按 Enter 後套用。第 149 幀供原始畫面對照，切換時會清除目前結果。
+- 放開後可切換原圖與 What-If，關閉畫面上的 `D1` 疊圖，或還原原位。下載項目包含乾淨的 `what-if.png`、帶 `D1` 與定位環的 `what-if-annotated.png`、以及包含來源幀、追蹤 ID 和冰刀落點的 `report.json`。
+- 瀏覽器在 Windows Chrome 無頭模式、1440 × 900 下，以三個落點循環做 30 次拖曳。時鐘從放開按鍵算到結果繪入畫布後的繪製週期。快取就緒時 p50 為 144.6 ms，p95 為 166.0 ms，最慢 179.2 ms。此結果是同一台機器的本機測量。
+- 額外延遲前一次請求以驗證快速連拖與切幀。確認晚回傳的畫面未覆蓋最新落點或第 149 幀。另驗證相鄰球員重疊提示、還原、標記切換和三項下載。匯出的兩張 PNG 為 1920 × 1080，乾淨圖編輯遮罩外變更為 0 像素，分析圖的額外像素變更限於圖標與冰刀標記區。
 
 下一步的關鍵幀、封堵規則與驗收條件見 [封堵射門線實作計畫](TACTICS_SHOT_LANE_PLAN.md)。
 
