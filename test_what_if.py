@@ -3,7 +3,7 @@ import unittest
 
 import numpy as np
 
-from what_if import ROOT, composite, place_player, prepare_player, project
+from what_if import ROOT, composite, place_player, placement_report, prepare_player, project
 
 
 class WhatIfPlacementTests(unittest.TestCase):
@@ -45,6 +45,22 @@ class WhatIfPlacementTests(unittest.TestCase):
                 target = project(self.player.image_to_ice, pixels)
                 with self.assertRaisesRegex(ValueError, message):
                     place_player(self.player, target, self.rink_size)
+
+    def test_rectangular_corners_are_outside_the_rounded_boards(self):
+        with self.assertRaisesRegex(ValueError, "outside the rounded boards"):
+            place_player(self.player, (0.1, 0.1), self.rink_size)
+
+    def test_shadow_and_small_cutout_overlap_leave_protected_pixels_unchanged(self):
+        for offset, overlaps_player in (([-1.5, 4.75], False), ([-1.25, 4.75], True)):
+            with self.subTest(offset=offset):
+                target = self.player.source_m + offset
+                placement = place_player(self.player, target, self.rink_size)
+                edited = composite(self.background, self.player, placement)
+                _, report = placement_report(self.frame, edited, self.player, placement)
+                self.assertGreater(report["clipped_shadow_pixels"], 0)
+                self.assertEqual(report["clipped_player_pixels"] > 0, overlaps_player)
+                self.assertEqual(report["protected_changed_pixels"], 0)
+                self.assertEqual(report["outside_mask_changed_pixels"], 0)
 
 
 if __name__ == "__main__":

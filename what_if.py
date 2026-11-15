@@ -18,6 +18,13 @@ from tactical_view_converter import TacticalViewConverter
 
 ROOT = Path(__file__).resolve().parent
 RINK = ROOT / "images/nhl-hockey-rink.png"
+RINK_CORNER_RADIUS_M = 4.4  # Rounded corners of the tactical board artwork.
+
+
+class PlacementError(ValueError):
+    def __init__(self, message, user_message):
+        super().__init__(message)
+        self.user_message = user_message
 
 
 def project(matrix, point):
@@ -59,6 +66,7 @@ class PreparedPlayer:
     protected: np.ndarray
     origin_px: np.ndarray
     alpha: np.ndarray
+    body_alpha: np.ndarray
     foreground: np.ndarray
 
 
@@ -72,6 +80,8 @@ class Placement:
     region: tuple
     alpha: np.ndarray
     shadow: np.ndarray
+    clipped_player_pixels: int
+    clipped_shadow_pixels: int
 
 
 def prepare_player(frame, config):
@@ -84,7 +94,9 @@ def prepare_player(frame, config):
         raise ValueError("Source skate anchor is outside the frame")
     source_m = project(image_to_ice, source_px)
     ice_to_image = np.linalg.inv(image_to_ice)
-    player = mask_from_polygons((height, width), config["player_polygons_px"])
+    body = mask_from_polygons((height, width), config["player_polygons_px"])
+    stick = mask_from_polygons((height, width), config.get("stick_polygons_px", []))
+    player = cv2.bitwise_or(body, stick)
     if not np.any(player):
         raise ValueError("Player mask is empty")
     x, y, w, h = cv2.boundingRect(player)
@@ -101,27 +113,36 @@ def prepare_player(frame, config):
     alpha = player[crop].copy()
     foreground = frame[crop].astype(np.float32) * (alpha[..., None].astype(np.float32) / 255)
     return PreparedPlayer(image_to_ice, ice_to_image, source_px, source_m, repair, protected,
-                          np.array([left, top]), alpha, foreground)
+                          np.array([left, top]), alpha, body[crop].copy(), foreground)
 
 
 def place_player(player, target, rink_size):
     height, width = player.repair.shape
     target_m = np.asarray(target, dtype=float)
     if target_m.shape != (2,) or not np.isfinite(target_m).all() or (target_m < 0).any() or (target_m > rink_size).any():
-        raise ValueError("Target is outside the rink")
-    target_px = project(player.ice_to_image, target_m)
+        raise PlacementError("Target is outside the rink", "請將 D1 放在冰場內。")
+    radius = RINK_CORNER_RADIUS_M
+    center = np.clip(target_m, radius, np.asarray(rink_size) - radius)
+    if np.linalg.norm(target_m - center) > radius + 1e-8:
+        raise PlacementError("Target is outside the rounded boards", "請將 D1 放在冰場圓角擋板內。")
+    try:
+        target_px = project(player.ice_to_image, target_m)
+    except ValueError as exc:
+        raise PlacementError("Target cannot be projected", "此落點無法投影到目前鏡頭，請移近原位。") from exc
     if (target_px < 0).any() or (target_px >= [width, height]).any():
-        raise ValueError("The target skate anchor is outside the camera view")
+        raise PlacementError("The target skate anchor is outside the camera view", "此落點在目前鏡頭外，請移近原位。")
     # The projective denominator gives a local scale approximation for a short move.
     depth = player.ice_to_image[2]
     scale = float((depth @ [*player.source_m, 1.0]) / (depth @ [*target_m, 1.0]))
     if not 0.75 <= scale <= 1.30:
-        raise ValueError("Target requires a larger perspective change than this 2D edit supports")
+        raise PlacementError("Target requires a larger perspective change than this 2D edit supports",
+                             "此落點的透視變化太大，請移近原位。")
     offset = target_px - scale * player.source_px
     x, y, w, h = cv2.boundingRect(player.alpha)
     corners = (np.array([[x, y], [x + w - 1, y + h - 1]]) + player.origin_px) * scale + offset
     if (corners < 0).any() or (corners >= [width, height]).any():
-        raise ValueError("The relocated player would be cut off by the frame")
+        raise PlacementError("The relocated player would be cut off by the frame",
+                             "D1 的輪廓會超出畫面，請往畫面內移。")
 
     # Cover the transformed cutout and the full support of the blurred skate shadow.
     start = np.maximum(0, np.floor(np.minimum(corners[0] - 2, target_px - 56)).astype(int))
@@ -131,12 +152,26 @@ def place_player(player, target, rink_size):
     transform = np.column_stack((np.eye(2) * scale, scale * player.origin_px + offset - start))
     alpha = cv2.warpAffine(player.alpha, transform, size, flags=cv2.INTER_LINEAR)
     shadow = contact_shadow(size[::-1], target_px - start, scale)
-    if np.any(player.protected[region] & (alpha > 0)):
-        raise ValueError("Edit intersects a protected object")
-    if np.any(player.protected[region] & (shadow > 0)):
-        raise ValueError("Contact shadow intersects a protected object")
+    protected = player.protected[region]
+    clipped_player = int(np.count_nonzero(protected & (alpha > 0)))
+    clipped_shadow = int(np.count_nonzero(protected & (shadow > 0)))
+    if clipped_player:
+        body = cv2.warpAffine(player.body_alpha, transform, size, flags=cv2.INTER_LINEAR) >= 128
+        stick = (alpha >= 128) & ~body
+        # Let the original object cover a small part of the cutout, while keeping
+        # the skates and the main silhouette visible.
+        foot_x, foot_y = np.clip(np.rint(target_px - start).astype(int), 0, end - start - 1)
+        if protected[foot_y, foot_x] or np.count_nonzero(protected & body) > max(4, np.count_nonzero(body) * .01):
+            raise PlacementError("D1 body or skate anchor overlaps a protected object",
+                                 "D1 的身體或冰刀與其他球員、冰球或球門重疊，請稍微移開。")
+        if np.count_nonzero(protected & stick) > np.count_nonzero(stick) * .25:
+            raise PlacementError("D1 stick substantially overlaps a protected object",
+                                 "D1 的球桿會被遮住太多，請稍微移開。")
+    alpha[protected] = 0
+    shadow[protected] = 0
     applied_foot_px = transform @ [*(player.source_px - player.origin_px), 1] + start
-    return Placement(target_m, target_px, scale, applied_foot_px, transform, region, alpha, shadow)
+    return Placement(target_m, target_px, scale, applied_foot_px, transform, region, alpha, shadow,
+                     clipped_player, clipped_shadow)
 
 
 def contact_shadow(shape, foot_px, scale):
@@ -276,6 +311,7 @@ def repair_workflow(ice_input, mask_input, output_prefix, seed):
 
 def composite(background, player, placement):
     moved = cv2.warpAffine(player.foreground, placement.transform, placement.alpha.shape[::-1], flags=cv2.INTER_LINEAR)
+    moved[player.protected[placement.region]] = 0
     alpha = placement.alpha[..., None].astype(np.float32) / 255
     shadow = placement.shadow[..., None].astype(np.float32) / 255
     patch = moved + background[placement.region] * (1 - shadow) * (1 - alpha)
@@ -352,6 +388,9 @@ def placement_report(frame, edited, player, placement):
     outside_changes = int(np.count_nonzero(changed & ~allowed))
     if outside_changes:
         raise ValueError("Pixels outside the edit mask changed")
+    protected_changes = int(np.count_nonzero(changed & player.protected))
+    if protected_changes:
+        raise ValueError("Pixels inside the protected mask changed")
     actual_px = placement.applied_foot_px
     error = float(np.linalg.norm(project(player.image_to_ice, actual_px) - placement.target_m))
     return allowed, {
@@ -359,6 +398,8 @@ def placement_report(frame, edited, player, placement):
         "applied_foot_px": actual_px.tolist(), "anchor_roundtrip_error_m": error,
         "distance_m": float(np.linalg.norm(placement.target_m - player.source_m)),
         "player_scale": placement.scale, "outside_mask_changed_pixels": outside_changes,
+        "protected_changed_pixels": protected_changes, "clipped_player_pixels": placement.clipped_player_pixels,
+        "clipped_shadow_pixels": placement.clipped_shadow_pixels,
         "changed_pixels": int(np.count_nonzero(changed)),
     }
 

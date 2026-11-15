@@ -10,7 +10,12 @@ async function post(path, payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  if (!response.ok) throw new Error((await response.json()).error);
+  if (!response.ok) {
+    const failure = await response.json();
+    const error = new Error(failure.error);
+    error.invalidPlacement = failure.invalid_placement === true;
+    throw error;
+  }
   return response;
 }
 
@@ -118,6 +123,7 @@ async function run() {
   const lane = byId("shot-lane");
   const suggest = byId("suggest");
   const { defense } = data;
+  let applied = null;
   let measuring = false;
   let queuedMeasurement = null;
 
@@ -240,13 +246,21 @@ async function run() {
 
   function invalidate() {
     state.revision += 1;
-    state.result?.bitmap.close();
     state.result = null;
     state.showResult = false;
     state.measurement = null;
     state.measurementError = "";
     queuedMeasurement = null;
     return state.revision;
+  }
+
+  function restorePosition() {
+    state.target = applied?.report.target_m ?? data.source_m;
+    state.result = applied;
+    state.showResult = !!applied;
+    state.measurement = null;
+    state.measurementError = "";
+    update();
   }
 
   function prepare(retry = false) {
@@ -311,22 +325,33 @@ async function run() {
         bitmap.close();
         return;
       }
-      state.result = { report, blob, bitmap };
+      applied?.bitmap.close();
+      applied = { report, blob, bitmap };
+      state.result = applied;
       state.showResult = true;
       update();
-      status("What-If 已就緒");
+      status(report.clipped_player_pixels ? "What-If 已就緒，已保留原畫面的遮擋物。" : "What-If 已就緒");
       if (warm) {
         requestAnimationFrame(() => requestAnimationFrame(() => {
           if (revision === state.revision) performance.measure("what-if-preview", { start: endedAt, end: performance.now() });
         }));
       }
     } catch (error) {
-      if (revision === state.revision) showError(error);
+      if (revision !== state.revision) return;
+      if (error.invalidPlacement) {
+        invalidate();
+        restorePosition();
+        status(error.message + " 已回到上一個有效站位。", true);
+      } else {
+        showError(error);
+      }
     }
   }
 
   function switchFrame(preview) {
     invalidate();
+    applied?.bitmap.close();
+    applied = null;
     state.reference = preview;
     state.selected = false;
     state.target = data.source_m;
@@ -336,9 +361,26 @@ async function run() {
     update();
   }
 
+  function constrainToIce(target, rect) {
+    const markerRadius = defender.offsetWidth / 2 + 4;
+    const padding = markerRadius * Math.max(data.rink_size[0] / rect.width, data.rink_size[1] / rect.height);
+    const radius = data.rink_corner_radius_m;
+    const inset = Math.max(radius, padding);
+    const center = target.map((value, i) => {
+      const lower = Math.min(inset, data.rink_size[i] / 2);
+      return Math.max(lower, Math.min(data.rink_size[i] - lower, value));
+    });
+    const difference = target.map((value, i) => value - center[i]);
+    const distance = Math.hypot(...difference);
+    const limit = Math.max(0, radius - padding);
+    if (distance <= limit) return target;
+    return center.map((value, i) => value + difference[i] * limit / distance);
+  }
+
   function pointerPosition(event, rect, offset) {
     const position = [event.clientX - rect.left, event.clientY - rect.top];
-    return position.map((value, i) => (value - offset[i]) * data.rink_size[i] / [rect.width, rect.height][i]);
+    const target = position.map((value, i) => (value - offset[i]) * data.rink_size[i] / [rect.width, rect.height][i]);
+    return constrainToIce(target, rect);
   }
 
   defender.addEventListener("pointerdown", event => {
@@ -348,7 +390,7 @@ async function run() {
     const rect = board.getBoundingClientRect();
     const offset = [event.clientX - rect.left - state.target[0] / data.rink_size[0] * rect.width,
                     event.clientY - rect.top - state.target[1] / data.rink_size[1] * rect.height];
-    state.drag = { id: event.pointerId, x: event.clientX, y: event.clientY, rect, offset, moved: false, original: state.target };
+    state.drag = { id: event.pointerId, x: event.clientX, y: event.clientY, rect, offset, moved: false };
     defender.setPointerCapture(event.pointerId);
     select();
   });
@@ -377,10 +419,10 @@ async function run() {
 
   function cancelDrag() {
     if (!state.drag) return;
-    state.target = state.drag.original;
     state.drag = null;
+    invalidate();
+    restorePosition();
     status("已取消拖曳");
-    previewTarget();
   }
 
   defender.addEventListener("pointercancel", cancelDrag);
@@ -393,10 +435,12 @@ async function run() {
       return;
     }
     const delta = { ArrowLeft: [-.2, 0], ArrowRight: [.2, 0], ArrowUp: [0, -.2], ArrowDown: [0, .2] }[event.key];
-    if (!delta) return;
+    if (!delta || state.drag) return;
     event.preventDefault();
+    const target = constrainToIce(state.target.map((value, i) => value + delta[i]), board.getBoundingClientRect());
+    if (target.every((value, i) => value === state.target[i])) return;
     invalidate();
-    state.target = state.target.map((value, index) => value + delta[index]);
+    state.target = target;
     select();
     previewTarget();
   });

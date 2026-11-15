@@ -11,7 +11,7 @@ import numpy as np
 import requests
 
 from shot_lane import DefenseMeasurement
-from what_if import (RINK, ROOT, TacticalViewConverter, case_tracks, check_comfy_ready, composite, comfy_repair,
+from what_if import (RINK, RINK_CORNER_RADIUS_M, ROOT, PlacementError, TacticalViewConverter, case_tracks, check_comfy_ready, composite, comfy_repair,
                      place_player, placement_report, prepare_player, repair_reference, repair_workflow,
                      rink_frame)
 
@@ -42,6 +42,7 @@ class Review:
             "image_size": self.frame.shape[1::-1], "source_m": self.player.source_m.tolist(),
             "source_px": self.player.source_px.tolist(), "ice_to_image": self.player.ice_to_image.tolist(),
             "tracks": tracks, "defense": self.defense.measure(self.player.source_m),
+            "rink_corner_radius_m": RINK_CORNER_RADIUS_M,
         }
 
     def cached_background(self, path):
@@ -129,6 +130,8 @@ def handler(review):
                     self.render(payload["target"])
                 else:
                     self.send_error(404)
+            except PlacementError as exc:
+                self.send_json(400, {"error": exc.user_message, "invalid_placement": True})
             except (KeyError, TypeError, ValueError) as exc:
                 self.send_json(400, {"error": str(exc)})
             except OSError:
