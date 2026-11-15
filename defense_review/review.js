@@ -25,9 +25,46 @@ function status(message, error = false) {
   byId("status").dataset.error = error;
 }
 
-function draw(canvas, bitmap, foot) {
+function drawLane(canvas, defense, project, coverage, scale = 1) {
+  if (defense?.status !== "ready") return;
+  const ctx = canvas.getContext("2d");
+  const puck = project(defense.puck_m);
+  const posts = defense.goal_posts_m.map(project);
+  if (!puck || posts.some(point => !point)) return;
+
+  function wedge([a, b], fill, outline) {
+    ctx.beginPath();
+    ctx.moveTo(...puck);
+    ctx.lineTo(...a);
+    ctx.lineTo(...b);
+    ctx.closePath();
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.strokeStyle = outline;
+    ctx.lineWidth = 2 * scale;
+    ctx.stroke();
+  }
+
+  wedge(posts, "rgba(67, 184, 202, .16)", "#3daaba");
+  for (const endpoints of coverage?.blocked_goal_spans_m ?? []) {
+    const span = endpoints.map(project);
+    if (span.every(Boolean)) wedge(span, "rgba(240, 161, 47, .42)", "#ce8624");
+  }
+  for (const [i, point] of [puck, ...posts].entries()) {
+    ctx.beginPath();
+    ctx.arc(...point, 4 * scale, 0, Math.PI * 2);
+    ctx.fillStyle = i === 0 ? "#172025" : "#5de0ea";
+    ctx.fill();
+    ctx.lineWidth = scale;
+    ctx.strokeStyle = "#fff";
+    ctx.stroke();
+  }
+}
+
+function draw(canvas, bitmap, foot, defense, project, coverage) {
   const ctx = canvas.getContext("2d");
   ctx.drawImage(bitmap, 0, 0);
+  drawLane(canvas, defense, project, coverage, 2);
   if (!foot) return;
 
   const [x, y] = foot;
@@ -76,7 +113,13 @@ async function run() {
   const state = {
     reference: false, selected: false, ready: false, preparing: null,
     revision: 0, target: data.source_m, drag: null, result: null, showResult: false,
+    measurement: null, measurementError: "",
   };
+  const lane = byId("shot-lane");
+  const suggest = byId("suggest");
+  const { defense } = data;
+  let measuring = false;
+  let queuedMeasurement = null;
 
   function locate(node, target) {
     node.style.left = `${100 * target[0] / data.rink_size[0]}%`;
@@ -97,6 +140,74 @@ async function run() {
       ? point : null;
   }
 
+  function updateDefense(measurement) {
+    lane.getContext("2d").clearRect(0, 0, lane.width, lane.height);
+    const summary = byId("coverage");
+    const detail = byId("coverage-detail");
+    suggest.hidden = true;
+    if (state.reference || defense.status !== "ready") {
+      summary.textContent = state.reference ? "前一幀僅供畫面對照" : defense.reason;
+      detail.textContent = "";
+      return;
+    }
+    drawLane(lane, defense,
+      ([x, y]) => [x * lane.width / data.rink_size[0], y * lane.height / data.rink_size[1]],
+      measurement?.after);
+    const before = defense.before.blocked_pct.toFixed(1);
+    const after = measurement?.after;
+    if (after) {
+      const change = measurement.delta_percentage_points;
+      const signedChange = (change > 0 ? "+" : "") + change.toFixed(1);
+      const central = after.central_blocked ? "已封住" : "仍開放";
+      summary.textContent = `原位 ${before}% → 落點 ${after.blocked_pct.toFixed(1)}%（${signedChange} 個百分點）`;
+      detail.textContent = `遮擋 ${after.blocked_angle_deg.toFixed(1)}° / ${defense.opening_angle_deg.toFixed(1)}° · 中央射門線${central} · D1 半徑 ${defense.blocking_radius_m.toFixed(2)} m`;
+    } else {
+      summary.textContent = state.measurementError || `原位 ${before}% · 量測落點中`;
+      detail.textContent = "";
+    }
+    const suggestion = defense.suggestion;
+    if (suggestion.status === "available") {
+      suggest.hidden = false;
+      suggest.textContent = `套用規則站位（${suggestion.distance_m.toFixed(2)} m）`;
+    } else {
+      const note = suggestion.status === "keep" ? "原位已封住中央方向，建議保留。" : suggestion.reason;
+      detail.textContent = [detail.textContent, note].filter(Boolean).join(" · ");
+    }
+  }
+
+  async function measurePreview() {
+    if (measuring || !queuedMeasurement) return;
+    measuring = true;
+    const { target, revision } = queuedMeasurement;
+    queuedMeasurement = null;
+    try {
+      const response = await post("/measure", { target });
+      const measurement = await response.json();
+      if (revision === state.revision && target === state.target && !state.result) {
+        state.measurement = measurement;
+        update();
+      }
+    } catch (error) {
+      if (revision === state.revision && target === state.target && !state.result) {
+        state.measurementError = error.message;
+        update();
+      }
+    } finally {
+      measuring = false;
+      measurePreview();
+    }
+  }
+
+  function previewTarget() {
+    state.measurement = null;
+    state.measurementError = "";
+    if (defense.status === "ready" && state.target !== data.source_m) {
+      queuedMeasurement = { target: state.target, revision: state.revision };
+      measurePreview();
+    }
+    update();
+  }
+
   function update() {
     const { result, target, selected, reference: preview } = state;
     const show = !preview && state.showResult && !!result;
@@ -104,7 +215,11 @@ async function run() {
     if (markers.checked && !preview && selected) {
       foot = show ? result.report.applied_foot_px : result ? data.source_px : iceToPixel(target);
     }
-    draw(shot, preview ? reference : show ? result.bitmap : original, foot);
+    const measurement = result?.report.defense ?? state.measurement ?? (target === data.source_m ? defense : null);
+    const overlay = markers.checked && !preview ? defense : null;
+    draw(shot, preview ? reference : show ? result.bitmap : original, foot, overlay, iceToPixel,
+      show || !result ? measurement?.after : defense.before);
+    updateDefense(measurement);
     byId("shot-title").textContent = show ? "What-If 影像" : "原鏡頭";
     byId("original").setAttribute("aria-pressed", !show);
     byId("result").setAttribute("aria-pressed", show);
@@ -128,6 +243,9 @@ async function run() {
     state.result?.bitmap.close();
     state.result = null;
     state.showResult = false;
+    state.measurement = null;
+    state.measurementError = "";
+    queuedMeasurement = null;
     return state.revision;
   }
 
@@ -170,10 +288,16 @@ async function run() {
   }
 
   async function apply(endedAt, retry = false) {
+    const measurement = state.measurement;
     const revision = invalidate();
     const target = state.target;
     const warm = state.ready;
-    update();
+    if (measurement?.target_m?.every((value, i) => value === target[i])) {
+      state.measurement = measurement;
+      update();
+    } else {
+      previewTarget();
+    }
     byId("retry").hidden = true;
     status(warm ? "合成中" : "修補中，已保留目前落點");
     try {
@@ -238,7 +362,7 @@ async function run() {
       invalidate();
     }
     state.target = pointerPosition(event, drag.rect, drag.offset);
-    update();
+    previewTarget();
   });
 
   defender.addEventListener("pointerup", event => {
@@ -256,7 +380,7 @@ async function run() {
     state.target = state.drag.original;
     state.drag = null;
     status("已取消拖曳");
-    update();
+    previewTarget();
   }
 
   defender.addEventListener("pointercancel", cancelDrag);
@@ -274,11 +398,17 @@ async function run() {
     invalidate();
     state.target = state.target.map((value, index) => value + delta[index]);
     select();
+    previewTarget();
   });
 
   byId("reset").onclick = () => switchFrame(false);
   byId("reference").onclick = () => switchFrame(true);
   byId("keyframe").onclick = () => switchFrame(false);
+  suggest.onclick = event => {
+    state.selected = true;
+    state.target = defense.suggestion.target_m;
+    apply(event.timeStamp);
+  };
   byId("original").onclick = () => { state.showResult = false; update(); };
   byId("result").onclick = () => { state.showResult = true; update(); };
   byId("retry").onclick = () => {
@@ -292,15 +422,20 @@ async function run() {
   byId("save-annotated").onclick = () => {
     const canvas = document.createElement("canvas");
     [canvas.width, canvas.height] = data.image_size;
-    draw(canvas, state.result.bitmap, state.result.report.applied_foot_px);
+    const result = state.result;
+    const measurement = result.report.defense;
+    draw(canvas, result.bitmap, result.report.applied_foot_px, measurement, iceToPixel, measurement.after);
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = "#162328";
-    ctx.fillRect(20, 20, 153, 48);
+    const caption = measurement.status === "ready"
+      ? `What-If   ·   ${measurement.before.blocked_pct.toFixed(1)}% → ${measurement.after.blocked_pct.toFixed(1)}%`
+      : "What-If";
     ctx.font = "bold 28px system-ui";
+    ctx.fillRect(20, 20, ctx.measureText(caption).width + 30, 48);
     ctx.textAlign = "left";
     ctx.textBaseline = "alphabetic";
     ctx.fillStyle = "#ffcf75";
-    ctx.fillText("What-If", 34, 53);
+    ctx.fillText(caption, 34, 53);
     canvas.toBlob(blob => {
       if (blob) download("what-if-annotated.png", blob);
       else status("無法匯出分析圖", true);

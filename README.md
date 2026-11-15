@@ -4,7 +4,7 @@
 
 本機 ComfyUI 修補與 What-If 戰術板動畫的重現步驟見 [TACTICS_WHAT_IF.md](TACTICS_WHAT_IF.md)。
 
-[防守復盤介面](TACTICS_WHAT_IF.md#防守實驗-2)支援在固定關鍵幀拖曳 `D1`、比較影像及匯出結果。
+[防守復盤介面](TACTICS_WHAT_IF.md#防守實驗-3)支援拖曳 `D1`、比較影像與水平射門角度覆蓋，並匯出分析結果。
 
 [防守復盤計畫](TACTICS_DEFENSE_PLAN.md)涵蓋拖曳、影像更新和球員標記。[封堵射門線計畫](TACTICS_SHOT_LANE_PLAN.md)記錄關鍵幀與量測驗收方式。
 

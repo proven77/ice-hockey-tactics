@@ -155,7 +155,24 @@ def estimate_ice_color(crop, mask):
     return (coordinates @ coefficients).clip(0, 255).astype(np.float32)
 
 
-def comfy_repair(frame, mask, session, url, output, seed):
+def repair_reference(config, frame):
+    reference = config.get("repair_reference")
+    if reference is None:
+        return None
+    matrix = np.asarray(reference["donor_to_source"], dtype=float)
+    if matrix.shape != (2, 3) or not np.isfinite(matrix).all() or abs(np.linalg.det(matrix[:, :2])) < 1e-8:
+        raise ValueError("Invalid repair reference alignment")
+    donor = rink_frame(ROOT / config["video"], reference["frame"])
+    aligned = cv2.warpAffine(donor, matrix, frame.shape[1::-1])
+    region = mask_from_polygons(frame.shape[:2], reference["polygons_px"])
+    valid = cv2.warpAffine(np.full(donor.shape[:2], 255, np.uint8), matrix, frame.shape[1::-1])
+    if np.any((region > 0) & (valid != 255)):
+        raise ValueError("Repair reference extends beyond the donor frame")
+    weights = np.minimum(cv2.distanceTransform(region, cv2.DIST_L2, 3) / 10, 1)
+    return aligned, weights
+
+
+def comfy_repair(frame, mask, session, url, output, seed, reference=None):
     x, y, w, h = cv2.boundingRect(mask)
     margin = 80
     left, top = max(0, x - margin), max(0, y - margin)
@@ -165,6 +182,10 @@ def comfy_repair(frame, mask, session, url, output, seed):
     crop, crop_mask = frame[region], mask[region]
     # Seed the inpainting with the local ice tone, including where the shadow fell.
     ice_color = estimate_ice_color(crop, crop_mask)
+    if reference is not None:
+        aligned, weights = reference
+        weight = weights[region][..., None]
+        ice_color = ice_color * (1 - weight) + aligned[region] * weight
     prefill = np.where(crop_mask[..., None] > 0, np.rint(ice_color), crop).astype(np.uint8)
     size = tuple(max(16, round(v * 512 / max(prefill.shape[:2]) / 16) * 16) for v in prefill.shape[1::-1])
     folder = f"hockey-what-if/{uuid4().hex}"
@@ -207,6 +228,8 @@ def comfy_repair(frame, mask, session, url, output, seed):
                 result = frame.copy()
                 restored = cv2.resize(repaired, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_AREA).astype(np.float32)
                 texture = restored - cv2.GaussianBlur(restored, (0, 0), 8)
+                if reference is not None:
+                    texture *= 1 - weight
                 restored = (ice_color + texture.clip(-8, 8)).clip(0, 255)
                 feather = np.minimum(cv2.distanceTransform(crop_mask, cv2.DIST_L2, 3) / 12, 1)[..., None]
                 result[region] = np.rint(restored * feather + crop * (1 - feather)).astype(np.uint8)
@@ -261,12 +284,25 @@ def composite(background, player, placement):
     return edited
 
 
+def case_tracks(config, image_to_ice):
+    if "other_players" in config:
+        return [
+            {"position": project(image_to_ice, track["foot_px"]).tolist(), "team": track["team"]}
+            for track in config["other_players"] if track["track_id"] != config["track_id"]
+        ]
+    with (ROOT / config["tracks_csv"]).open(newline="", encoding="utf-8") as stream:
+        return [
+            {"position": [float(row["x_m"]), float(row["y_m"])], "team": int(row["team"])}
+            for row in csv.DictReader(stream)
+            if int(row["frame"]) == config["frame"] and int(row["track_id"]) != config["track_id"]
+            and row["x_m"] and row["y_m"]
+        ]
+
+
 def write_animation(path, config, rink_size, source_m, target_m):
     rink = cv2.resize(cv2.imread(str(RINK)), (900, 382), interpolation=cv2.INTER_AREA)
     palette = {0: (130, 130, 130), 1: (75, 126, 23), 2: (242, 244, 247)}
-    with (ROOT / config["tracks_csv"]).open(newline="", encoding="utf-8") as stream:
-        tracks = [row for row in csv.DictReader(stream)
-                  if int(row["frame"]) == config["frame"] and row["x_m"] and row["y_m"]]
+    tracks = case_tracks(config, np.asarray(config["image_to_ice"]))
 
     def pixel(position):
         return tuple(np.rint(np.asarray(position) / rink_size * [899, 381] + [50, 84]).astype(int))
@@ -280,12 +316,10 @@ def write_animation(path, config, rink_size, source_m, target_m):
             board[84:466, 50:950] = rink
             cv2.putText(board, "WHAT-IF  /  DEFENSIVE REPOSITIONING", (50, 54), 0, 1, (244, 239, 228), 2, cv2.LINE_AA)
             cv2.arrowedLine(board, pixel(source_m), pixel(target_m), (24, 112, 223), 2, cv2.LINE_AA, tipLength=0.19)
-            for row in tracks:
-                if int(row["track_id"]) == config["track_id"]:
-                    continue
-                point = pixel([float(row["x_m"]), float(row["y_m"])])
+            for track in tracks:
+                point = pixel(track["position"])
                 cv2.circle(board, point, 11, (35, 37, 42), -1, cv2.LINE_AA)
-                cv2.circle(board, point, 8, palette[int(row["team"])], -1, cv2.LINE_AA)
+                cv2.circle(board, point, 8, palette[track["team"]], -1, cv2.LINE_AA)
             fraction = min(1.0, max(0.0, (index - 12) / 55))
             progress = fraction * fraction * (3 - 2 * fraction)
             cv2.circle(board, pixel(target_m), 15, (24, 112, 223), 2, cv2.LINE_AA)
@@ -378,7 +412,9 @@ def main():
             staging = Path(tempfile.mkdtemp(prefix=f".{args.output.name}.tmp-", dir=args.output.parent))
             write_png(staging / "original.png", frame)
             started = monotonic()
-            background, prompt_id = comfy_repair(frame, player.repair, session, url, staging, args.seed)
+            background, prompt_id = comfy_repair(
+                frame, player.repair, session, url, staging, args.seed, repair_reference(config, frame)
+            )
         repair_seconds = round(monotonic() - started, 1)
         write_png(staging / "repaired-background.png", background)
         write_png(staging / "repair-mask.png", player.repair)
@@ -387,6 +423,8 @@ def main():
             "calibration_inliers": config.get("calibration_inliers"), "source_m": player.source_m.tolist(),
             "comfy_prompt_id": prompt_id, "comfy_seconds": repair_seconds, "seed": args.seed,
         }
+        if "repair_reference" in config:
+            report["repair_reference"] = config["repair_reference"]
         if len(placements) == 1:
             report.update(render_placement(frame, background, player, placements[0], config, rink_size, staging))
         else:

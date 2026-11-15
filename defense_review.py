@@ -1,5 +1,4 @@
 import argparse
-import csv
 import json
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,8 +10,9 @@ import cv2
 import numpy as np
 import requests
 
-from what_if import (RINK, ROOT, TacticalViewConverter, composite, comfy_repair,
-                     place_player, placement_report, prepare_player, repair_workflow,
+from shot_lane import DefenseMeasurement
+from what_if import (RINK, ROOT, TacticalViewConverter, case_tracks, check_comfy_ready, composite, comfy_repair,
+                     place_player, placement_report, prepare_player, repair_reference, repair_workflow,
                      rink_frame)
 
 
@@ -35,18 +35,13 @@ class Review:
         self.background = self.cached_background(repair_run) if repair_run else None
         self.worker = ThreadPoolExecutor(max_workers=1)
         self.pending = None
-        with (ROOT / case["tracks_csv"]).open(encoding="utf-8", newline="") as stream:
-            tracks = [
-                {"position": [float(row["x_m"]), float(row["y_m"])], "team": int(row["team"])}
-                for row in csv.DictReader(stream)
-                if int(row["frame"]) == case["frame"] and int(row["track_id"]) != case["track_id"]
-                and row["x_m"] and row["y_m"]
-            ]
+        tracks = case_tracks(case, self.player.image_to_ice)
+        self.defense = DefenseMeasurement(case, self.player, self.rink_size, tracks)
         self.metadata = {
             "frame": case["frame"], "reference_frame": case["frame"] - 1, "rink_size": self.rink_size,
             "image_size": self.frame.shape[1::-1], "source_m": self.player.source_m.tolist(),
             "source_px": self.player.source_px.tolist(), "ice_to_image": self.player.ice_to_image.tolist(),
-            "tracks": tracks,
+            "tracks": tracks, "defense": self.defense.measure(self.player.source_m),
         }
 
     def cached_background(self, path):
@@ -56,8 +51,8 @@ class Review:
                                    graph["13"]["inputs"]["filename_prefix"], 103)
         if (report["source_video"], report["source_frame"], report["track_id"], report["seed"]) != (
             self.case["video"], self.case["frame"], self.case["track_id"], 103
-        ) or graph != expected:
-            raise ValueError("修補快取的案例、seed 或工作流不符")
+        ) or graph != expected or report.get("repair_reference") != self.case.get("repair_reference"):
+            raise ValueError("修補快取的案例、seed、參考幀或工作流不符")
         original = cv2.imread(str(path / "original.png"))
         mask = cv2.imread(str(path / "repair-mask.png"), cv2.IMREAD_GRAYSCALE)
         background = cv2.imread(str(path / "repaired-background.png"))
@@ -75,7 +70,9 @@ class Review:
         output = Path(mkdtemp(prefix="defense-review-", dir=cache_root))
         with requests.Session() as session:
             session.trust_env = False
-            return comfy_repair(self.frame, self.player.repair, session, self.comfy_url, output, 103)
+            check_comfy_ready(session, self.comfy_url)
+            reference = repair_reference(self.case, self.frame)
+            return comfy_repair(self.frame, self.player.repair, session, self.comfy_url, output, 103, reference)
 
 
 def handler(review):
@@ -125,6 +122,9 @@ def handler(review):
                     raise ValueError("需要 JSON 物件")
                 if self.path == "/prepare":
                     self.prepare(payload.get("retry") is True)
+                elif self.path == "/measure":
+                    placement = place_player(review.player, payload["target"], review.rink_size)
+                    self.send_json(200, review.defense.measure(placement.target_m))
                 elif self.path == "/render":
                     self.render(payload["target"])
                 else:
@@ -162,7 +162,8 @@ def handler(review):
             edited = composite(background, review.player, placement)
             _, report = placement_report(review.frame, edited, review.player, placement)
             report.update(source_frame=review.case["frame"], track_id=review.case["track_id"],
-                          label="D1", source_m=review.player.source_m.tolist(), comfy_prompt_id=prompt_id)
+                          label="D1", source_m=review.player.source_m.tolist(), comfy_prompt_id=prompt_id,
+                          defense=review.defense.measure(placement.target_m))
             data = png(edited)
             report["server_ms"] = round((perf_counter() - started) * 1000, 2)
             self.send_data(200, "image/png", data, report)
@@ -176,6 +177,7 @@ def main():
     parser = argparse.ArgumentParser(description="Serve a local defensive What-If review.")
     parser.add_argument("--case", type=Path, default=ROOT / "what_if_case.json")
     parser.add_argument("--repair-run", type=Path, help="Reuse a verified What-If experiment output")
+    parser.add_argument("--measure-only", action="store_true", help="Print geometry and exit without generating an image")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--comfy-port", type=int, default=8191)
     args = parser.parse_args()
@@ -184,6 +186,11 @@ def main():
         if case["frame"] < 1 or not 1 <= args.comfy_port <= 65535:
             raise ValueError("案例需要前一幀，且 ComfyUI 連接埠必須有效")
         review = Review(case, args.repair_run, args.comfy_port)
+        if args.measure_only:
+            suggestion = review.defense.metadata.get("suggestion", {})
+            target = suggestion.get("target_m", review.player.source_m)
+            print(json.dumps(review.defense.measure(target), indent=2))
+            return
         with ThreadingHTTPServer(("127.0.0.1", args.port), handler(review)) as server:
             server.prepare_lock = Lock()
             print(f"http://127.0.0.1:{server.server_port}", flush=True)

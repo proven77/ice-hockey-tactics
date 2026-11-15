@@ -94,6 +94,25 @@ $cvPy = Join-Path $env:USERPROFILE 'anaconda3\envs\cv\python.exe'
 - 瀏覽器在 Windows Chrome 無頭模式、1440 × 900 下，以三個落點循環做 30 次拖曳。時鐘從放開按鍵算到結果繪入畫布後的繪製週期。快取就緒時 p50 為 144.6 ms，p95 為 166.0 ms，最慢 179.2 ms。此結果是同一台機器的本機測量。
 - 額外延遲前一次請求以驗證快速連拖與切幀。確認晚回傳的畫面未覆蓋最新落點或第 149 幀。另驗證相鄰球員重疊提示、還原、標記切換和三項下載。匯出的兩張 PNG 為 1920 × 1080，乾淨圖編輯遮罩外變更為 0 像素，分析圖的額外像素變更限於圖標與冰刀標記區。
 
-下一步的關鍵幀、封堵規則與驗收條件見 [封堵射門線實作計畫](TACTICS_SHOT_LANE_PLAN.md)。
+### 防守實驗 3
+
+在 repo 根目錄用 Windows `cv` 執行下列指令。第 592 幀的冰球、門柱、冰刀與其他球員站位已存於 `what_if_shot_case.json`。它使用手動複核的同幀資料，可直接從示範影片重現。
+
+```powershell
+$cvPy = Join-Path $env:USERPROFILE 'anaconda3\envs\cv\python.exe'
+& $cvPy defense_review.py --case what_if_shot_case.json --measure-only
+& $cvPy what_if.py what_if_shot_case.json --output output-videos/whatif-defense-step3-guided
+& $cvPy defense_review.py --case what_if_shot_case.json --repair-run output-videos/whatif-defense-step3-guided --port 8770
+```
+
+第一個指令直接輸出射門幾何與建議落點 JSON，無須啟動 ComfyUI。第二個指令需要本機 ComfyUI，並建立新的結果資料夾。已有這份快取時可直接執行第三個指令，在瀏覽器開啟 `http://127.0.0.1:8770`。也可省略 `--repair-run`，由復盤介面在選取球員時啟動原位修補。
+
+1. 拖曳 `D1` 時，戰術板和原鏡頭以青色顯示球門角度、琥珀色顯示 D1 覆蓋的角度。放開後更新 What-If 圖。點「套用規則站位」才會套用建議。
+2. 用「原圖」與「What-If」看移動前後的影像與射門區域。第 591 幀供畫面對照。第 150 幀案例缺少冰球量測證據，會顯示「待確認」，仍可拖曳。
+3. 下載乾淨圖、帶 D1 與射門角度的分析圖，或內含 `defense` 欄位的 JSON。報告記錄像素標註、冰面座標、遮擋半徑、校正依據與前後結果。
+
+固定案例的建議落點為 `(54.11, 12.56) m`，距原位 2.73 m。以 0.45 m 半徑近似 D1 的水平遮擋，球門可見開口約 11.3°，覆蓋由 0.0% 變為 76.2%（約 8.6°），中央方向被遮擋。這是單一防守者在固定畫面的估計，會受到半徑和投影誤差影響。推估射門結果或出手前可達性需要球高、其他球員動作和時間資料。
+
+第 592 幀的原位同時遮住擋板與冰面標線。修補時對齊第 628 幀，將擋板和標線裁在修補遮罩內，再用本機 ComfyUI 修補其餘冰面。實拍結果經逐像素比對，編輯遮罩外變更為 0。Chrome 驗證了拖曳中的量測、切幀後捨棄過期回應、套用建議與匯出，以及第 150 幀缺冰球時的拖曳。校正和規則詳見 [封堵射門線實作計畫](TACTICS_SHOT_LANE_PLAN.md)。
 
 教練拖曳、放開後的影像更新與防守球員標記見 [防守復盤 What-If 計畫](TACTICS_DEFENSE_PLAN.md)。
