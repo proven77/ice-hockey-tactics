@@ -3,7 +3,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from tempfile import mkdtemp
+from tempfile import TemporaryDirectory, mkdtemp
 from time import perf_counter
 
 import cv2
@@ -11,9 +11,10 @@ import numpy as np
 import requests
 
 from shot_lane import DefenseMeasurement
+from tactical_animation import write_animation
 from what_if import (RINK, RINK_CORNER_RADIUS_M, ROOT, PlacementError, TacticalViewConverter, case_tracks, check_comfy_ready, composite, comfy_repair,
                      place_player, placement_report, prepare_player, repair_reference, repair_workflow,
-                     rink_frame)
+                     rink_frame, tactical_report)
 
 
 def png(image):
@@ -35,13 +36,13 @@ class Review:
         self.background = self.cached_background(repair_run) if repair_run else None
         self.worker = ThreadPoolExecutor(max_workers=1)
         self.pending = None
-        tracks = case_tracks(case, self.player.image_to_ice)
-        self.defense = DefenseMeasurement(case, self.player, self.rink_size, tracks)
+        self.tracks = case_tracks(case, self.player.image_to_ice)
+        self.defense = DefenseMeasurement(case, self.player, self.rink_size, self.tracks)
         self.metadata = {
             "frame": case["frame"], "reference_frame": case["frame"] - 1, "rink_size": self.rink_size,
             "image_size": self.frame.shape[1::-1], "source_m": self.player.source_m.tolist(),
             "source_px": self.player.source_px.tolist(), "ice_to_image": self.player.ice_to_image.tolist(),
-            "tracks": tracks, "defense": self.defense.measure(self.player.source_m),
+            "tracks": self.tracks, "defense": self.defense.measure(self.player.source_m),
             "rink_corner_radius_m": RINK_CORNER_RADIUS_M,
         }
 
@@ -74,6 +75,10 @@ class Review:
             check_comfy_ready(session, self.comfy_url)
             reference = repair_reference(self.case, self.frame)
             return comfy_repair(self.frame, self.player.repair, session, self.comfy_url, output, 103, reference)
+
+    def describe_placement(self, target):
+        placement = place_player(self.player, target, self.rink_size)
+        return placement, tactical_report(self.case, self.rink_size, self.player, placement, self.defense)
 
 
 def handler(review):
@@ -128,6 +133,8 @@ def handler(review):
                     self.send_json(200, review.defense.measure(placement.target_m))
                 elif self.path == "/render":
                     self.render(payload["target"])
+                elif self.path == "/animation":
+                    self.animation(payload["target"])
                 else:
                     self.send_error(404)
             except PlacementError as exc:
@@ -156,7 +163,7 @@ def handler(review):
 
         def render(self, target):
             started = perf_counter()
-            placement = place_player(review.player, target, review.rink_size)
+            placement, tactics = review.describe_placement(target)
             prepared = review.background
             if prepared is None:
                 self.send_json(409, {"error": "修補背景尚未就緒"})
@@ -164,12 +171,21 @@ def handler(review):
             background, prompt_id = prepared
             edited = composite(background, review.player, placement)
             _, report = placement_report(review.frame, edited, review.player, placement)
-            report.update(source_frame=review.case["frame"], track_id=review.case["track_id"],
-                          label="D1", source_m=review.player.source_m.tolist(), comfy_prompt_id=prompt_id,
-                          defense=review.defense.measure(placement.target_m))
+            report.update(tactics, comfy_prompt_id=prompt_id)
             data = png(edited)
             report["server_ms"] = round((perf_counter() - started) * 1000, 2)
             self.send_data(200, "image/png", data, report)
+
+        def animation(self, target):
+            _, report = review.describe_placement(target)
+            lane = review.defense.lane
+            with TemporaryDirectory(prefix="hockey-animation-") as temp:
+                path = Path(temp) / "tactical-path.mp4"
+                write_animation(path, RINK, review.rink_size, review.tracks, report, lane.coverage if lane else None)
+                data = path.read_bytes()
+                if not data:
+                    raise OSError("Empty tactical animation")
+            self.send_data(200, "video/mp4", data, report)
 
     return Handler
 

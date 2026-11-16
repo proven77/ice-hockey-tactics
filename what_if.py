@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 import requests
 
+from tactical_animation import animation_info, write_animation
 from tactical_view_converter import TacticalViewConverter
 
 
@@ -335,37 +336,14 @@ def case_tracks(config, image_to_ice):
         ]
 
 
-def write_animation(path, config, rink_size, source_m, target_m):
-    rink = cv2.resize(cv2.imread(str(RINK)), (900, 382), interpolation=cv2.INTER_AREA)
-    palette = {0: (130, 130, 130), 1: (75, 126, 23), 2: (242, 244, 247)}
-    tracks = case_tracks(config, np.asarray(config["image_to_ice"]))
-
-    def pixel(position):
-        return tuple(np.rint(np.asarray(position) / rink_size * [899, 381] + [50, 84]).astype(int))
-
-    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30, (1000, 550))
-    if not writer.isOpened():
-        raise ValueError("Could not open the tactical animation writer")
-    try:
-        for index in range(90):
-            board = np.full((550, 1000, 3), (27, 24, 19), dtype=np.uint8)
-            board[84:466, 50:950] = rink
-            cv2.putText(board, "WHAT-IF  /  DEFENSIVE REPOSITIONING", (50, 54), 0, 1, (244, 239, 228), 2, cv2.LINE_AA)
-            cv2.arrowedLine(board, pixel(source_m), pixel(target_m), (24, 112, 223), 2, cv2.LINE_AA, tipLength=0.19)
-            for track in tracks:
-                point = pixel(track["position"])
-                cv2.circle(board, point, 11, (35, 37, 42), -1, cv2.LINE_AA)
-                cv2.circle(board, point, 8, palette[track["team"]], -1, cv2.LINE_AA)
-            fraction = min(1.0, max(0.0, (index - 12) / 55))
-            progress = fraction * fraction * (3 - 2 * fraction)
-            cv2.circle(board, pixel(target_m), 15, (24, 112, 223), 2, cv2.LINE_AA)
-            cv2.circle(board, pixel(source_m + progress * (target_m - source_m)), 10, (24, 112, 223), -1, cv2.LINE_AA)
-            text = (f"Track {config['track_id']}   |   {np.linalg.norm(target_m - source_m):.2f} m   |   "
-                    f"Target ({target_m[0]:.2f}, {target_m[1]:.2f}) m   |   Illustrative path")
-            cv2.putText(board, text, (50, 516), 0, 0.60, (227, 226, 218), 1, cv2.LINE_AA)
-            writer.write(board)
-    finally:
-        writer.release()
+def tactical_report(config, rink_size, player, placement, defense):
+    source = player.source_m.tolist()
+    target = placement.target_m.tolist()
+    return {
+        "source_video": config["video"], "source_frame": config["frame"], "track_id": config["track_id"],
+        "label": "D1", "source_m": source, "target_m": target,
+        "defense": defense.measure(target), "animation": animation_info(rink_size, source, target),
+    }
 
 
 def comparison(original, edited, index, output):
@@ -404,7 +382,7 @@ def placement_report(frame, edited, player, placement):
     }
 
 
-def render_placement(frame, background, player, placement, config, rink_size, output):
+def render_placement(frame, background, player, placement, config, rink_size, output, tracks, defense):
     started = perf_counter()
     edited = composite(background, player, placement)
     composite_ms = (perf_counter() - started) * 1000
@@ -412,11 +390,16 @@ def render_placement(frame, background, player, placement, config, rink_size, ou
     write_png(output / "edit-mask.png", allowed.astype(np.uint8) * 255)
     write_png(output / "what-if.png", edited)
     comparison(frame, edited, config["frame"], output / "comparison.png")
-    write_animation(output / "tactical-path.mp4", config, rink_size, player.source_m, placement.target_m)
-    return {**report, "composite_ms": round(composite_ms, 2), "animation_fps": 30, "animation_frames": 90}
+    report.update(tactical_report(config, rink_size, player, placement, defense))
+    coverage_at = defense.lane.coverage if defense.lane is not None else None
+    write_animation(output / "tactical-path.mp4", RINK, rink_size, tracks, report, coverage_at)
+    return {**report, "composite_ms": round(composite_ms, 2),
+            "animation_fps": report["animation"]["fps"], "animation_frames": report["animation"]["frames"]}
 
 
 def main():
+    from shot_lane import DefenseMeasurement
+
     parser = argparse.ArgumentParser(description="Render hockey What-If edits using one repair per selected player.")
     parser.add_argument("case", type=Path)
     parser.add_argument("--output", type=Path, required=True)
@@ -439,6 +422,8 @@ def main():
         frame = rink_frame(ROOT / config["video"], config["frame"])
         rink_size = TacticalViewConverter(RINK).size_m
         player = prepare_player(frame, config)
+        tracks = case_tracks(config, player.image_to_ice)
+        defense = DefenseMeasurement(config, player, rink_size, tracks)
         targets = args.target if args.target else [config["target_m"]]
         placements = []
         for index, target in enumerate(targets, 1):
@@ -467,13 +452,15 @@ def main():
         if "repair_reference" in config:
             report["repair_reference"] = config["repair_reference"]
         if len(placements) == 1:
-            report.update(render_placement(frame, background, player, placements[0], config, rink_size, staging))
+            report.update(render_placement(frame, background, player, placements[0], config, rink_size, staging,
+                                           tracks, defense))
         else:
             report["placements"] = []
             for index, placement in enumerate(placements, 1):
                 output = staging / f"target-{index:02d}"
                 output.mkdir()
-                result = render_placement(frame, background, player, placement, config, rink_size, output)
+                result = render_placement(frame, background, player, placement, config, rink_size, output,
+                                          tracks, defense)
                 report["placements"].append({"directory": output.name, **result})
         (staging / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         staging.rename(args.output)

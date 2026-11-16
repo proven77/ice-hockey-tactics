@@ -4,11 +4,12 @@ const defender = byId("defender");
 const shot = byId("shot");
 const markers = byId("markers");
 
-async function post(path, payload) {
+async function post(path, payload, signal) {
   const response = await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+    signal,
   });
   if (!response.ok) {
     const failure = await response.json();
@@ -122,8 +123,10 @@ async function run() {
   };
   const lane = byId("shot-lane");
   const suggest = byId("suggest");
+  const saveAnimation = byId("save-animation");
   const { defense } = data;
   let applied = null;
+  let animationRequest = null;
   let measuring = false;
   let queuedMeasurement = null;
 
@@ -231,6 +234,8 @@ async function run() {
     byId("result").setAttribute("aria-pressed", show);
     byId("result").disabled = preview || !result;
     for (const id of ["save-clean", "save-annotated", "save-report"]) byId(id).disabled = preview || !result;
+    saveAnimation.disabled = preview || !result || animationRequest !== null;
+    saveAnimation.textContent = animationRequest ? "動畫匯出中…" : "戰術動畫 MP4";
     byId("reference").setAttribute("aria-pressed", preview);
     byId("keyframe").setAttribute("aria-pressed", !preview);
     defender.hidden = preview;
@@ -246,6 +251,8 @@ async function run() {
 
   function invalidate() {
     state.revision += 1;
+    animationRequest?.abort();
+    animationRequest = null;
     state.result = null;
     state.showResult = false;
     state.measurement = null;
@@ -463,6 +470,28 @@ async function run() {
   byId("save-clean").onclick = () => download("what-if.png", state.result.blob);
   byId("save-report").onclick = () => download("report.json",
     new Blob([JSON.stringify(state.result.report, null, 2) + "\n"], { type: "application/json" }));
+  saveAnimation.onclick = async () => {
+    if (!state.result || state.reference || animationRequest) return;
+    const target = state.result.report.target_m;
+    const request = new AbortController();
+    animationRequest = request;
+    update();
+    try {
+      const response = await post("/animation", { target }, request.signal);
+      const blob = await response.blob();
+      if (animationRequest === request) {
+        download("tactical-path.mp4", blob);
+        status("戰術動畫已匯出");
+      }
+    } catch (error) {
+      if (animationRequest === request) status("無法匯出戰術動畫。" + error.message, true);
+    } finally {
+      if (animationRequest === request) {
+        animationRequest = null;
+        update();
+      }
+    }
+  };
   byId("save-annotated").onclick = () => {
     const canvas = document.createElement("canvas");
     [canvas.width, canvas.height] = data.image_size;
