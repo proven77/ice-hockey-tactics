@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "fixtures": {
+    "frame150": {
+      "case": "what_if_case.json",
+      "repair_run": "output-videos/whatif-defense-step1",
+      "support_ankle": "l_ankle",
+      "support_skate_note": "Lower, nearer skate in the source image",
+      "source_joints_px": {
+        "nose": [915, 392],
+        "neck": [925, 401],
+        "r_shoulder": [918, 409],
+        "r_elbow": [914, 424],
+        "r_wrist": [910, 433],
+        "l_shoulder": [941, 411],
+        "l_elbow": [946, 438],
+        "l_wrist": [933, 457],
+        "r_hip": [934, 457],
+        "r_knee": [947, 488],
+        "r_ankle": [954, 517],
+        "l_hip": [941, 460],
+        "l_knee": [932, 492],
+        "l_ankle": [940, 526]
+      },
+      "inferred_source_joints": [
+        "r_shoulder",
+        "r_elbow",
+        "r_hip",
+        "r_knee",
+        "r_ankle"
+      ],
+      "target_joint_offsets_source_px": {
+        "nose": [-10, 9],
+        "neck": [-9, 9],
+        "r_shoulder": [-9, 9],
+        "r_elbow": [-11, 7],
+        "r_wrist": [-11, 7],
+        "l_shoulder": [-8, 9],
+        "l_elbow": [-9, 8],
+        "l_wrist": [-11, 7],
+        "r_hip": [-2, 7],
+        "r_knee": [-4, 5],
+        "l_hip": [-3, 8],
+        "l_knee": [-6, 4]
+      },
+      "source_stick_px": [
+        [910, 437],
+        [976, 501],
+        [991, 491]
+      ],
+      "target_stick_offsets_source_px": [
+        [-11, 7],
+        [-11, 7],
+        [-11, 7]
+      ]
+    },
+    "frame592": {
+      "case": "what_if_shot_case.json",
+      "repair_run": "output-videos/whatif-defense-step3-guided",
+      "support_ankle": "r_ankle",
+      "support_skate_note": "Ice-contact skate on the image-left side in the source frame",
+      "source_joints_px": {
+        "nose": [1034, 325],
+        "neck": [1039, 335],
+        "r_shoulder": [1024, 340],
+        "r_elbow": [1015, 345],
+        "r_wrist": [1006, 355],
+        "l_shoulder": [1062, 342],
+        "l_elbow": [1078, 363],
+        "l_wrist": [1060, 388],
+        "r_hip": [1045, 375],
+        "r_knee": [1030, 398],
+        "r_ankle": [1048, 439],
+        "l_hip": [1072, 377],
+        "l_knee": [1095, 403],
+        "l_ankle": [1120, 432]
+      },
+      "inferred_source_joints": [
+        "r_elbow",
+        "r_hip",
+        "l_hip"
+      ],
+      "target_joint_offsets_source_px": {
+        "nose": [-9, 7],
+        "neck": [-7, 7],
+        "r_shoulder": [-7, 7],
+        "r_elbow": [-8, 10],
+        "r_wrist": [-10, 13],
+        "l_shoulder": [-7, 7],
+        "l_elbow": [-8, 6],
+        "l_wrist": [-10, 4],
+        "r_hip": [-4, 5],
+        "r_knee": [-7, 3],
+        "l_hip": [-4, 5],
+        "l_knee": [-4, 5],
+        "l_ankle": [-2, 3]
+      },
+      "source_stick_px": [
+        [1019, 368],
+        [1126, 420],
+        [1150, 412]
+      ],
+      "target_stick_offsets_source_px": [
+        [-11, 4],
+        [-10, 4],
+        [-10, 4]
+      ]
+    }
+  },
+  "placements": [
+    {
+      "name": "frame150-open-ice",
+      "fixture": "frame150",
+      "target_m": [44.65, 15.82]
+    },
+    {
+      "name": "frame592-goal-clear",
+      "fixture": "frame592",
+      "target_m": [54, 12.5]
+    },
+    {
+      "name": "frame592-near-protection",
+      "fixture": "frame592",
+      "target_m": [54.5056323732457, 12.602716012492216]
+    }
+  ]
+}

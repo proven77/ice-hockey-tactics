@@ -46,4 +46,6 @@
 
 順序 4 已接入 3 秒戰術動畫匯出。影片讀取當前 What-If 的 D1 落點與量測，支援無射門資料的案例，並驗證最後一幀位置與單張、JSON 一致。[防守實驗 4](TACTICS_WHAT_IF.md#防守實驗-4)
 
+下一階段以固定關鍵幀比較 OpenCV 合成、局部修飾與姿態重繪，先驗收冰刀落點和保護區，再決定是否接入復盤頁。[實驗 5｜D1 單幀局部重繪計畫](TACTICS_PLAYER_REDRAW_PLAN.md)
+
 第一階段的防守成效是所選球員對冰面射門角度的幾何覆蓋。若要判斷能否在出手前到位，需另外標記事件時間並估計球員速度。計畫上傳至 [proven77/ice-hockey-tactics](https://github.com/proven77/ice-hockey-tactics)。
