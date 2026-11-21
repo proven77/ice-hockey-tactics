@@ -154,10 +154,10 @@ def verify_output(folder, baseline, edited, mask, anchor_lock):
     return checks
 
 
-def contact_sheet(baseline, edited, difference, crop):
+def contact_sheet(baseline, edited, difference, crop, *, result_label="ComfyUI refinement", difference_scale=8):
     panels = []
-    for image, title in ((baseline[crop.region], "OpenCV"), (edited[crop.region], "ComfyUI refinement"),
-                         (difference[crop.region], "Difference x 8")):
+    for image, title in ((baseline[crop.region], "OpenCV"), (edited[crop.region], result_label),
+                         (difference[crop.region], f"Difference x {difference_scale}")):
         panel = cv2.resize(image, (384, 384), interpolation=cv2.INTER_NEAREST)
         panel = cv2.copyMakeBorder(panel, 32, 0, 0, 0, cv2.BORDER_CONSTANT, value=(24, 24, 24))
         cv2.putText(panel, title, (10, 23), cv2.FONT_HERSHEY_SIMPLEX, .65, (240, 240, 240), 1, cv2.LINE_AA)

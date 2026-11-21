@@ -1,7 +1,7 @@
 # 實驗 5｜D1 單幀局部重繪計畫
 
 日期：2026-11-17
-狀態：5.1 已完成，5.2 已完成九張局部修飾比較。像素保護通過，視覺改善不足以採用。姿態重繪與 ControlNet 留待 5.3 實測。
+狀態：5.1、5.2、5.3 已完成固定案例比較。5.3 能產生可見的姿態變化，九張均通過像素保護，但球衣身份線索與球桿尚未穩定，整體暫不採用。
 
 ## 目標
 
@@ -112,3 +112,46 @@ $cvPy = Join-Path $env:USERPROFILE 'anaconda3\envs\cv\python.exe'
 | `quality-review.json` | 本次代理的逐張品質判斷與暫不採用的原因。 |
 
 5.2 已完成低幅度修飾的對照。這組參數的價值在於驗證局部生成可以安全回貼，畫面品質的收益仍不足以加入操作流程。5.3 可沿用同一批基準，改以姿態條件檢查承重腳、重心與球桿是否能在指定位置產生可辨識的改變，再決定後續投入。
+
+## 5.3 姿態重繪實作與驗收
+
+2026-11-20 執行生成，2026-11-21 完成成圖檢視。使用原有 ComfyUI 0.37.0、Z-Image Turbo 與 RTX 4060 8 GB，新增官方 ControlNet 2.1 Lite 2602 8-step 權重，下載大小為 2,016,627,488 bytes。檔案放在 ComfyUI 的 `models/model_patches`，本機已核對 SHA-256。原有 ComfyUI 節點即能載入。[官方模型卡](https://huggingface.co/alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1) · [本輪固定版本權重](https://huggingface.co/alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1/resolve/5155fc56d17821007d6f62ac192c09e0f0e72016/Z-Image-Turbo-Fun-Controlnet-Union-2.1-lite-2602-8steps.safetensors)
+
+```text
+Model filename
+Z-Image-Turbo-Fun-Controlnet-Union-2.1-lite-2602-8steps.safetensors
+
+SHA-256
+3ea098db9bd145be525c7e2366920b6d76c5ffd46b3d7aa8169bbc943fdaee35
+```
+
+在 repo 根目錄重現，先依前述指令啟動本機 ComfyUI 8191。
+
+```powershell
+$cvPy = Join-Path $env:USERPROFILE 'anaconda3\envs\cv\python.exe'
+& $cvPy redraw_player.py --output output-videos/whatif-defense-step5-3
+& $cvPy summarize_player_redraw.py --output output-videos/whatif-defense-step5-3
+```
+
+每組固定 seed 103、104、105，共九張，使用 8 步、CFG 1.0、denoise 0.65、控制強度 0.85。局部輸入為 512 × 512，輸出回貼至 1920 × 1080。可先用 `--case frame150-open-ice --seed 103` 跑一張，再加 `--resume` 補完。改參數時用新的輸出目錄。若 ComfyUI 工作出錯，診斷檔案會留在輸出的 `failures` 子目錄。
+
+模型讀取 `pose-target.png`、原合成草稿和 `redraw-mask`。球桿方向參考來自合成草稿及提示，身體 Pose 條件沒有額外加入球桿控制通道。回貼保護其他球員、球門和冰球，承重冰刀本身也開放生成。本輪的姿態和冰刀接點因此能直接檢查生成造成的變化。
+
+| 本輪實測 | 結果 |
+| --- | --- |
+| 主比較 | 三組 × 三個 seed，共九張，均生成成功 |
+| 第一張含 ControlNet 初次載入，基礎模型已在服務內 | 29.24 秒 |
+| 後續八張生成 | 中位數 16.65 秒，範圍 16.63–18.72 秒 |
+| 抽樣整張 GPU 顯存使用峰值，含桌面 | 7346 MiB |
+| 遮罩外、總編輯區外及保護區像素變更 | 九張均為 0 |
+| 承重冰刀接點 | 八張可人工估計，一張待確認 |
+| 可估計的八張接點誤差 | 1.89–5.63 px，同幀校正回算約 0.052–0.190 m |
+| 同時符合定位、姿態、身份與器材的候選 | 0/9，暫不採用 |
+
+冰刀接點由代理依原圖座標網格人工估計，標點不確定性約 ±2 px。接近保護物案例的 seed 103、105 回算誤差約 0.190 m，接近原訂 0.20 m 門檻，需使用者複核。球門前無遮擋的 seed 103 因刀刃朝向與接地邊界模糊，列為待確認。此處誤差是相對於人工標註和同幀矩陣的估計。
+
+三組都有可見的軀幹、膝蓋或持桿變化，但與指定姿態僅部分相符。模型會改變球衣號碼、胸前圖案及臉部細節；部分結果把球桿向冰刀下方延伸。額外以第一組 seed 103 試過 denoise 0.45、控制強度 1.0，人物細節漂移減少，屈膝和重心改變也較弱。該單張試跑尚未滿足採用條件。
+
+每筆 `seed-*` 保留 `redrawn.png`、原始裁切生成圖、差異圖、並排圖、API workflow、ComfyUI history 與報告。`overview.png` 對照 OpenCV、目標 Pose 和三個 seed，`contact-grid.png` 及每張的 `contact-detail.png` 可核對接點。`verification.json` 記錄重讀輸出後的像素與耗時結果，`quality-review.json` 保留代理逐張判斷和標點，`model-provenance.json` 保存下載版本與校驗值。
+
+5.3 已確認這套控制模型能改變人物姿態，當前主要缺口是球衣身份線索與球桿約束。復盤頁繼續使用 OpenCV。後續可先評估固定頭盔及球衣主體、只開放腿部與持桿區的遮罩，或增加人物參考條件，再按相同九張標準比較。5.4 介面接入依候選品質通過後安排。
