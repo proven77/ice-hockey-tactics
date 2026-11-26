@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import os
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -354,9 +355,20 @@ def comparison(original, edited, index, output):
     write_png(output, cv2.hconcat(panels))
 
 
+def filesystem_path(path):
+    """Use Windows extended paths for persistent, nested experiment artifacts."""
+    path = Path(path).absolute()
+    value = str(path)
+    if os.name == "nt" and not value.startswith("\\\\?\\"):
+        return Path("\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value)
+    return path
+
+
 def write_png(path, image):
-    if not cv2.imwrite(str(path), image):
+    ok, encoded = cv2.imencode(".png", image)
+    if not ok:
         raise OSError(f"Could not write {path}")
+    filesystem_path(path).write_bytes(encoded.tobytes())
 
 
 def placement_report(frame, edited, player, placement):

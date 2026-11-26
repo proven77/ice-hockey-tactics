@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory, mkdtemp
 from time import perf_counter
+from urllib.parse import urlsplit, parse_qs
 
 import cv2
 import numpy as np
@@ -45,6 +46,12 @@ class Review:
             "tracks": self.tracks, "defense": self.defense.measure(self.player.source_m),
             "rink_corner_radius_m": RINK_CORNER_RADIUS_M,
         }
+        self.redraw = None
+
+    def enable_redraw(self, cache_root=None, legacy_root=None):
+        from review_redraw import RedrawQueue
+        self.redraw = RedrawQueue(self, cache_root, legacy_root)
+        self.metadata["redraw"] = self.redraw.metadata
 
     def cached_background(self, path):
         report = json.loads((path / "report.json").read_text(encoding="utf-8"))
@@ -109,6 +116,17 @@ def handler(review):
             self.send_data(status, "application/json", json.dumps(value).encode())
 
         def do_GET(self):
+            path = urlsplit(self.path)
+            if path.path in ("/redraw/status", "/redraw/image") and review.redraw:
+                try:
+                    job_id = parse_qs(path.query)["id"][0]
+                    if path.path == "/redraw/status":
+                        self.send_json(200, review.redraw.get(job_id))
+                    else:
+                        self.send_data(200, "image/png", review.redraw.image(job_id))
+                except (KeyError, ValueError) as exc:
+                    self.send_json(400, {"error": str(exc)})
+                return
             asset = assets.get(self.path)
             if asset:
                 self.send_data(200, *asset)
@@ -135,6 +153,12 @@ def handler(review):
                     self.render(payload["target"])
                 elif self.path == "/animation":
                     self.animation(payload["target"])
+                elif self.path == "/redraw":
+                    self.send_json(202, review.redraw.submit(payload["target"]))
+                elif self.path == "/redraw/contact":
+                    self.send_json(200, review.redraw.contact(payload))
+                elif self.path == "/redraw/cancel":
+                    self.send_json(200, review.redraw.cancel(payload["id"]))
                 else:
                     self.send_error(404)
             except PlacementError as exc:
@@ -171,7 +195,9 @@ def handler(review):
             background, prompt_id = prepared
             edited = composite(background, review.player, placement)
             _, report = placement_report(review.frame, edited, review.player, placement)
-            report.update(tactics, comfy_prompt_id=prompt_id)
+            report.update(tactics, comfy_prompt_id=prompt_id, result_kind="opencv_preview",
+                          position_review={"status": "deterministic_placement"},
+                          expected_contact_px=report["applied_foot_px"])
             data = png(edited)
             report["server_ms"] = round((perf_counter() - started) * 1000, 2)
             self.send_data(200, "image/png", data, report)
@@ -199,6 +225,8 @@ def main():
     parser.add_argument("--measure-only", action="store_true", help="Print geometry and exit without generating an image")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--comfy-port", type=int, default=8191)
+    parser.add_argument("--redraw-cache", type=Path, help="Persistent exact-target redraw cache")
+    parser.add_argument("--redraw-run", type=Path, help="Experiment 5.3 reviewed candidate directory")
     args = parser.parse_args()
     try:
         case = json.loads(args.case.read_text(encoding="utf-8"))
@@ -210,6 +238,7 @@ def main():
             target = suggestion.get("target_m", review.player.source_m)
             print(json.dumps(review.defense.measure(target), indent=2))
             return
+        review.enable_redraw(args.redraw_cache, args.redraw_run)
         with ThreadingHTTPServer(("127.0.0.1", args.port), handler(review)) as server:
             server.prepare_lock = Lock()
             print(f"http://127.0.0.1:{server.server_port}", flush=True)

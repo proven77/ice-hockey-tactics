@@ -120,6 +120,7 @@ async function run() {
     reference: false, selected: false, ready: false, preparing: null,
     revision: 0, target: data.source_m, drag: null, result: null, showResult: false,
     measurement: null, measurementError: "",
+    pose: null, view: "original", contactMode: false, job: null, redrawBusy: false,
   };
   const lane = byId("shot-lane");
   const suggest = byId("suggest");
@@ -129,6 +130,45 @@ async function run() {
   let animationRequest = null;
   let measuring = false;
   let queuedMeasurement = null;
+  let contactSequence = 0;
+  let contactRequest = Promise.resolve();
+  const redrawStatus = (message) => { byId("redraw-status").textContent = message; };
+
+  function activeResult() {
+    if (state.view === "pose") return state.pose;
+    if (state.view === "preview") return state.result;
+    if (!state.result) return null;
+    return { bitmap: original, blob: null, report: { ...state.result.report,
+      result_kind: "original", target_m: data.source_m, requested_target_m: state.target,
+      applied_foot_px: data.source_px, expected_contact_px: data.source_px,
+      position_review: {status: "original_frame"}, defense, animation: null } };
+  }
+
+  function contactLabel(review) {
+    const measurement = review?.contact_measurement;
+    const label = review?.status === "usable_for_position_demo" ? "位置展示可用（人工估計）" : "位置待確認";
+    return measurement ? `${label} · ${measurement.error_px.toFixed(2)} px / ${measurement.error_m.toFixed(3)} m · 標點估計 ±${measurement.annotation_uncertainty_px} px`
+      : `${label} · 點選承重冰刀與冰面接點，並核對人物合理性；看不清時保留待確認。`;
+  }
+
+  function drawContact() {
+    const canvas = byId("contact-zoom");
+    if (!state.pose || state.view !== "pose") return;
+    const ctx = canvas.getContext("2d");
+    const [x, y] = state.pose.report.expected_contact_px;
+    const origin = [Math.max(0, Math.min(shot.width - 160, x - 80)), Math.max(0, Math.min(shot.height - 80, y - 40))];
+    canvas.dataset.origin = JSON.stringify(origin);
+    canvas.dataset.active = state.contactMode;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(state.pose.bitmap, ...origin, 160, 80, 0, 0, 480, 240);
+    for (const [point, color] of [[state.pose.report.expected_contact_px, "#ffcf75"],
+      [state.pose.report.position_review?.contact_measurement?.frame_px, "#53f0d5"]]) {
+      if (!point) continue;
+      const [u, v] = point.map((c, i) => (c - origin[i]) * 3);
+      ctx.strokeStyle = color; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(u - 7, v); ctx.lineTo(u + 7, v); ctx.moveTo(u, v - 7); ctx.lineTo(u, v + 7); ctx.stroke();
+    }
+  }
 
   function locate(node, target) {
     node.style.left = `${100 * target[0] / data.rink_size[0]}%`;
@@ -219,22 +259,33 @@ async function run() {
 
   function update() {
     const { result, target, selected, reference: preview } = state;
-    const show = !preview && state.showResult && !!result;
+    const active = activeResult();
+    const show = !preview && state.view !== "original" && !!active;
     let foot = null;
     if (markers.checked && !preview && selected) {
-      foot = show ? result.report.applied_foot_px : result ? data.source_px : iceToPixel(target);
+      foot = show ? active.report.applied_foot_px : result ? data.source_px : iceToPixel(target);
     }
     const measurement = result?.report.defense ?? state.measurement ?? (target === data.source_m ? defense : null);
     const overlay = markers.checked && !preview ? defense : null;
-    draw(shot, preview ? reference : show ? result.bitmap : original, foot, overlay, iceToPixel,
+    draw(shot, preview ? reference : show ? active.bitmap : original, foot, overlay, iceToPixel,
       show || !result ? measurement?.after : defense.before);
     updateDefense(measurement);
-    byId("shot-title").textContent = show ? "What-If 影像" : "原鏡頭";
-    byId("original").setAttribute("aria-pressed", !show);
-    byId("result").setAttribute("aria-pressed", show);
+    byId("shot-title").textContent = show ? state.view === "pose" ? "姿態重繪 · D1" : "即時合成預覽" : "原鏡頭";
+    byId("original").setAttribute("aria-pressed", state.view === "original");
+    byId("result").setAttribute("aria-pressed", state.view === "preview");
+    byId("pose-result").setAttribute("aria-pressed", state.view === "pose");
     byId("result").disabled = preview || !result;
+    byId("pose-result").disabled = preview || !state.pose;
+    byId("redraw").disabled = preview || !result || !data.redraw?.supported || state.redrawBusy;
+    byId("redraw").textContent = state.redrawBusy ? "重繪處理中…" : "重繪 D1";
+    byId("reviewed-target").hidden = preview || !data.redraw?.preset;
+    byId("contact-panel").hidden = preview || state.view !== "pose" || !state.pose;
+    byId("contact-mode").setAttribute("aria-pressed", state.contactMode);
+    shot.dataset.contact = state.contactMode && state.view === "pose";
+    if (state.pose) byId("contact-status").textContent = contactLabel(state.pose.report.position_review);
+    drawContact();
     for (const id of ["save-clean", "save-annotated", "save-report"]) byId(id).disabled = preview || !result;
-    saveAnimation.disabled = preview || !result || animationRequest !== null;
+    saveAnimation.disabled = preview || !result || state.view === "original" || animationRequest !== null;
     saveAnimation.textContent = animationRequest ? "動畫匯出中…" : "戰術動畫 MP4";
     byId("reference").setAttribute("aria-pressed", preview);
     byId("keyframe").setAttribute("aria-pressed", !preview);
@@ -255,6 +306,16 @@ async function run() {
     animationRequest = null;
     state.result = null;
     state.showResult = false;
+    if (state.job) post("/redraw/cancel", { id: state.job }).catch(() => {});
+    state.job = null;
+    state.redrawBusy = false;
+    state.pose?.bitmap.close();
+    state.pose = null;
+    state.contactMode = false;
+    contactSequence += 1;
+    byId("plausible").checked = false;
+    state.view = "original";
+    redrawStatus("落點已更新；套用預覽後可重繪。");
     state.measurement = null;
     state.measurementError = "";
     queuedMeasurement = null;
@@ -265,6 +326,7 @@ async function run() {
     state.target = applied?.report.target_m ?? data.source_m;
     state.result = applied;
     state.showResult = !!applied;
+    state.view = applied ? "preview" : "original";
     state.measurement = null;
     state.measurementError = "";
     update();
@@ -336,6 +398,7 @@ async function run() {
       applied = { report, blob, bitmap };
       state.result = applied;
       state.showResult = true;
+      state.view = "preview";
       update();
       status(report.clipped_player_pixels ? "What-If 已就緒，已保留原畫面的遮擋物。" : "What-If 已就緒");
       if (warm) {
@@ -353,6 +416,81 @@ async function run() {
         showError(error);
       }
     }
+  }
+
+  async function redraw() {
+    if (!state.result || state.redrawBusy) return;
+    const revision = state.revision;
+    const target = [...state.target];
+    const started = performance.now();
+    state.redrawBusy = true;
+    update();
+    redrawStatus("檢查目前落點快取與輸入…");
+    try {
+      let job = await (await post("/redraw", { target })).json();
+      const readyOnSubmit = job.state === "ready";
+      if (revision !== state.revision) {
+        post("/redraw/cancel", {id: job.id}).catch(() => {});
+        return;
+      }
+      state.job = job.id;
+      while (job.state === "queued" || job.state === "running") {
+        redrawStatus(job.state === "queued" ? "已排隊；可以繼續拖曳或切換畫面。" : "建立姿態／重繪中；可以繼續拖曳。首次載入模型可能較久。");
+        await new Promise(resolve => setTimeout(resolve, 250));
+        if (revision !== state.revision || state.job !== job.id) return;
+        const response = await fetch(`/redraw/status?id=${encodeURIComponent(job.id)}`);
+        if (!response.ok) throw new Error("無法取得重繪狀態，可重試。");
+        job = await response.json();
+      }
+      if (revision !== state.revision || state.job !== job.id) return;
+      if (job.state !== "ready") throw new Error(job.error || "工作已被新要求取代，可重試。");
+      if (job.report.source_frame !== data.frame || !job.target_m.every((v, i) => v === state.target[i])) throw new Error("重繪來源或落點不符，已拒絕套用。");
+      const response = await fetch(`/redraw/image?id=${encodeURIComponent(job.id)}`);
+      if (!response.ok) throw new Error("無法讀取重繪結果");
+      const blob = await response.blob();
+      const bitmap = await createImageBitmap(blob);
+      if (revision !== state.revision || state.job !== job.id) { bitmap.close(); return; }
+      state.pose?.bitmap.close();
+      state.pose = { blob, bitmap, report: {...job.report,
+        delivery: readyOnSubmit ? "memory_cache" : job.report.provenance === "new_generation" ? "generated_or_joined_job" : "disk_cache"} };
+      state.view = "pose";
+      state.contactMode = false;
+      byId("plausible").checked = job.report.position_review?.person_and_contact_plausible === true;
+      state.pose.report.ui_result_ready_seconds = (performance.now() - started) / 1000;
+      update();
+      const outcome = state.pose.report.delivery.includes("cache") ? "快取已載入" : "重繪完成";
+      redrawStatus(`${outcome} · seed ${job.report.seed} · ${contactLabel(job.report.position_review)}`);
+      // Painting can pause in a background tab; completion must not depend on a repaint callback.
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        if (revision !== state.revision || state.job !== job.id) return;
+        const elapsed = (performance.now() - started) / 1000;
+        state.pose.report.ui_display_seconds = elapsed;
+        performance.measure("pose-redraw-display", {start: started, end: performance.now()});
+        redrawStatus(`${outcome} · seed ${job.report.seed} · 顯圖 ${elapsed.toFixed(2)} s · 本頁排隊 ${job.report.queue_seconds.toFixed(2)} s · ${contactLabel(job.report.position_review)}`);
+      }));
+    } catch (error) {
+      if (revision === state.revision) redrawStatus(error.message + " 即時預覽仍可使用，按重繪 D1 重試。");
+    } finally {
+      if (revision === state.revision) { state.redrawBusy = false; update(); }
+    }
+  }
+
+  async function saveContact(point) {
+    const pose = state.pose;
+    const revision = state.revision;
+    if (!pose || state.view !== "pose") return;
+    const sequence = ++contactSequence;
+    const plausible = point !== null && byId("plausible").checked;
+    try {
+      const request = contactRequest.catch(() => {}).then(() => post("/redraw/contact", {
+        id: pose.report.job_id, point, plausible }));
+      contactRequest = request;
+      const response = await request;
+      const job = await response.json();
+      if (revision !== state.revision || state.pose !== pose || sequence !== contactSequence) return;
+      state.pose.report.position_review = job.report.position_review;
+      update();
+    } catch (error) { if (revision === state.revision) redrawStatus(error.message); }
   }
 
   function switchFrame(preview) {
@@ -460,16 +598,42 @@ async function run() {
     state.target = defense.suggestion.target_m;
     apply(event.timeStamp);
   };
-  byId("original").onclick = () => { state.showResult = false; update(); };
-  byId("result").onclick = () => { state.showResult = true; update(); };
+  byId("reviewed-target").onclick = event => {
+    state.selected = true; state.target = [...data.redraw.preset.target_m]; apply(event.timeStamp);
+  };
+  byId("redraw").onclick = redraw;
+  byId("original").onclick = () => { state.view = "original"; state.contactMode = false; update(); };
+  byId("result").onclick = () => { state.view = "preview"; state.contactMode = false; update(); };
+  byId("pose-result").onclick = () => { state.view = "pose"; update(); };
+  byId("contact-mode").onclick = () => { state.contactMode = !state.contactMode; update(); };
+  byId("contact-clear").onclick = () => { byId("plausible").checked = false; saveContact(null); };
+  byId("plausible").onchange = () => saveContact(state.pose?.report.position_review?.contact_measurement?.frame_px ?? null);
+  shot.onclick = event => {
+    if (!state.contactMode || state.view !== "pose") return;
+    const rect = shot.getBoundingClientRect();
+    saveContact([(event.clientX - rect.x) * shot.width / rect.width, (event.clientY - rect.y) * shot.height / rect.height]);
+  };
+  byId("contact-zoom").onclick = event => {
+    if (!state.contactMode || state.view !== "pose") return;
+    const canvas = byId("contact-zoom");
+    const rect = canvas.getBoundingClientRect();
+    const origin = JSON.parse(canvas.dataset.origin);
+    saveContact([origin[0] + (event.clientX - rect.x) * 160 / rect.width, origin[1] + (event.clientY - rect.y) * 80 / rect.height]);
+  };
   byId("retry").onclick = () => {
     if (state.target === data.source_m) select(true);
     else apply(performance.now(), true);
   };
   markers.onchange = update;
-  byId("save-clean").onclick = () => download("what-if.png", state.result.blob);
+  byId("save-clean").onclick = async () => {
+    const result = activeResult();
+    const revision = state.revision, view = state.view;
+    if (!result) return;
+    const blob = result.blob ?? await (await fetch("/original.png")).blob();
+    if (revision === state.revision && view === state.view) download("what-if.png", blob);
+  };
   byId("save-report").onclick = () => download("report.json",
-    new Blob([JSON.stringify(state.result.report, null, 2) + "\n"], { type: "application/json" }));
+    new Blob([JSON.stringify(activeResult().report, null, 2) + "\n"], { type: "application/json" }));
   saveAnimation.onclick = async () => {
     if (!state.result || state.reference || animationRequest) return;
     const target = state.result.report.target_m;
@@ -495,14 +659,16 @@ async function run() {
   byId("save-annotated").onclick = () => {
     const canvas = document.createElement("canvas");
     [canvas.width, canvas.height] = data.image_size;
-    const result = state.result;
+    const result = activeResult();
+    const revision = state.revision, view = state.view;
     const measurement = result.report.defense;
-    draw(canvas, result.bitmap, result.report.applied_foot_px, measurement, iceToPixel, measurement.after);
+    draw(canvas, result.bitmap, result.report.applied_foot_px, measurement, iceToPixel, measurement.after ?? measurement.before);
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = "#162328";
-    const caption = measurement.status === "ready"
-      ? `What-If   ·   ${measurement.before.blocked_pct.toFixed(1)}% → ${measurement.after.blocked_pct.toFixed(1)}%`
-      : "What-If";
+    const kind = {original: "Original", opencv_preview: "Preview", pose_redraw: "Pose redraw"}[result.report.result_kind];
+    const caption = measurement.status === "ready" && measurement.after
+      ? `${kind}   ·   ${measurement.before.blocked_pct.toFixed(1)}% → ${measurement.after.blocked_pct.toFixed(1)}%`
+      : kind;
     ctx.font = "bold 28px system-ui";
     ctx.fillRect(20, 20, ctx.measureText(caption).width + 30, 48);
     ctx.textAlign = "left";
@@ -510,6 +676,7 @@ async function run() {
     ctx.fillStyle = "#ffcf75";
     ctx.fillText(caption, 34, 53);
     canvas.toBlob(blob => {
+      if (revision !== state.revision || view !== state.view) return;
       if (blob) download("what-if-annotated.png", blob);
       else status("無法匯出分析圖", true);
     }, "image/png");

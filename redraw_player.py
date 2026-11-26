@@ -72,6 +72,55 @@ def validate_pose_output(folder, baseline, edited, mask):
     return checks
 
 
+def generation_settings(denoise=.65, strength=.85):
+    return {
+        "workflow_version": 1, "denoise": denoise, "control_strength": strength,
+        "steps": 8, "cfg": 1.0, "prompt": PROMPT, "feather_px": 3,
+        "control_model": CONTROL_FILE, "control_model_sha256": CONTROL_SHA256,
+        "contact_policy": "generated_from_pose_without_pixel_lock",
+    }
+
+
+def generate_candidate(session, url, source_dir, staging, identity, inputs=None):
+    """One masked pose redraw, shared by the CLI and the asynchronous review server."""
+    source = json.loads((source_dir / "report.json").read_text(encoding="utf-8"))
+    x, y, w, h = source["crop"]["xywh"]
+    if w != h or identity["input_sha256"] != bundle_digest(source_dir):
+        raise ValueError("Conditioning bundle identity mismatch")
+    crop = Crop(x, y, w)
+    baseline = read_image(source_dir / "opencv.png")
+    conditioning = read_image(source_dir / "conditioning-image.png")
+    mask = read_image(source_dir / "redraw-mask-full.png", mask=True)
+    protected = read_image(source_dir / "protected-mask-full.png", mask=True) > 0
+    if np.any((mask > 0) & protected) or not np.array_equal(crop.sample(baseline), conditioning):
+        raise ValueError("Invalid conditioning crop or protected mask")
+    if inputs is None:
+        prefix = "hockey-pose-redraw/" + uuid4().hex
+        inputs = (upload(session, url, prefix, "input.png", conditioning),
+                  upload(session, url, prefix, "mask.png", crop.sample(mask, mask=True)),
+                  upload(session, url, prefix, "pose.png", read_image(source_dir / "pose-target.png")), prefix)
+    image_input, mask_input, pose_input, prefix = inputs
+    graph = pose_workflow(image_input, mask_input, pose_input, prefix + f"/seed-{identity['seed']}",
+                          identity["seed"], identity["denoise"], identity["control_strength"])
+    generated, timing = run_prompt(session, url, graph, staging)
+    edited = paste_refinement(baseline, generated, mask, crop)
+    checks = validate_pose_output(source_dir, baseline, edited, mask)
+    difference = np.clip(cv2.absdiff(edited, baseline).astype(np.uint16) * 4, 0, 255).astype(np.uint8)
+    record = {
+        "identity": identity, "source_frame": source["source_frame"], "track_id": source["track_id"],
+        "target_m": source["target_m"], "requested_contact_frame_px": source["pose"]["contact_frame_px"],
+        "crop": source["crop"], "generation": timing, "verification": checks,
+        "quality_review": "pending_contact_and_pose_review",
+    }
+    for filename, image in {"comfy-raw.png": generated, "redrawn.png": edited,
+                            "difference-x4.png": difference,
+                            "comparison.png": contact_sheet(baseline, edited, difference, crop,
+                                                            result_label="Pose redraw", difference_scale=4)}.items():
+        write_png(staging / filename, image)
+    json_file(staging / "report.json", record)
+    return record, inputs
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, default=ROOT / "output-videos/whatif-defense-step5-1")
@@ -97,12 +146,7 @@ def main():
         if set(names) - {case["name"] for case in specification["cases"]}:
             raise ValueError("Unknown bundle case")
         seeds = args.seeds or [103, 104, 105]
-        settings = {
-            "workflow_version": 1, "denoise": args.denoise, "control_strength": args.strength,
-            "steps": 8, "cfg": 1.0, "prompt": PROMPT, "feather_px": 3,
-            "control_model": CONTROL_FILE, "control_model_sha256": CONTROL_SHA256,
-            "contact_policy": "generated_from_pose_without_pixel_lock",
-        }
+        settings = generation_settings(args.denoise, args.strength)
         records = []
         with requests.Session() as session:
             session.trust_env = False
@@ -155,45 +199,18 @@ def main():
                     with TemporaryDirectory(dir=destination.parent, prefix=".pose-") as temporary:
                         staging = Path(temporary) / "result"
                         staging.mkdir()
-                        if inputs is None:
-                            prefix = "hockey-pose-redraw/" + uuid4().hex
-                            inputs = (
-                                upload(session, url, prefix, "input.png", conditioning),
-                                upload(session, url, prefix, "mask.png", crop.sample(mask, mask=True)),
-                                upload(session, url, prefix, "pose.png", pose), prefix,
-                            )
-                        image_input, mask_input, pose_input, prefix = inputs
-                        graph = pose_workflow(image_input, mask_input, pose_input, prefix + f"/seed-{seed}",
-                                              seed, args.denoise, args.strength)
                         print(f"{name} seed {seed}, denoise {args.denoise}, control {args.strength}", flush=True)
                         try:
-                            generated, timing = run_prompt(session, url, graph, staging)
+                            record, inputs = generate_candidate(session, url, source_dir, staging, identity, inputs)
                         except (ValueError, requests.RequestException) as exc:
                             failure = output / "failures" / f"{name}-seed-{seed}-{uuid4().hex[:8]}"
                             failure.parent.mkdir(exist_ok=True)
                             staging.rename(failure)
                             raise ValueError(f"{exc}. Diagnostic files kept at {failure}") from exc
-                        edited = paste_refinement(baseline, generated, mask, crop)
-                        checks = validate_pose_output(source_dir, baseline, edited, mask)
-                        difference = np.clip(cv2.absdiff(edited, baseline).astype(np.uint16) * 4, 0, 255).astype(np.uint8)
-                        record = {
-                            "identity": identity, "source_frame": source["source_frame"], "track_id": source["track_id"],
-                            "target_m": source["target_m"], "requested_contact_frame_px": source["pose"]["contact_frame_px"],
-                            "crop": source["crop"], "generation": timing, "verification": checks,
-                            "quality_review": "pending_contact_and_pose_review",
-                        }
-                        for filename, image in {
-                            "comfy-raw.png": generated, "redrawn.png": edited,
-                            "difference-x4.png": difference,
-                            "comparison.png": contact_sheet(baseline, edited, difference, crop,
-                                                            result_label="Pose redraw", difference_scale=4),
-                        }.items():
-                            write_png(staging / filename, image)
-                        json_file(staging / "report.json", record)
                         staging.rename(destination)
                         records.append(record)
                         json_file(output / "summary.json", {"phase": "5.3", "jobs": records})
-                        print(f"Finished in {timing['request_seconds']:.1f}s", flush=True)
+                        print(f"Finished in {record['generation']['request_seconds']:.1f}s", flush=True)
             json_file(output / "summary.json", {"phase": "5.3", "jobs": records})
     except (KeyError, OSError, ValueError, requests.RequestException, cv2.error) as exc:
         parser.exit(2, f"{parser.prog}: error: {exc}\n")

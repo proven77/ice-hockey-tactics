@@ -1,5 +1,7 @@
 # 冰球 What-If 單幀與戰術板動畫
 
+2026-11-27 已新增姿態重繪、三種畫面比較、新落點非同步生成及人工接點核對。最新操作見 [實驗 5.4 使用說明](TACTICS_REVIEW_REDRAW.md)，以下保留前四個實驗的建立與驗收紀錄。
+
 固定示例使用 `input-videos/snapshot-demo.mp4` 的第 150 幀（從 0 起算）。白隊的追蹤 ID 4 從約 `(42.42, 15.82)` 公尺移至手動指定的 `(44.65, 15.82)` 公尺，位移 2.23 公尺。這個案例用來檢查重定位、修補和動畫的底層流程，協防落點需要由使用者依情境決定。 [示範片來源](https://github.com/danielrzhang/SnapShot#before-snapshot-processing)
 
 ## 本機環境

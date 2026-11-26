@@ -44,6 +44,14 @@ input { accent-color: #ffca65; }
 #retry { margin-top: 8px; }
 .output { margin-top: 17px; flex-wrap: wrap; }
 .exports { flex-wrap: wrap; }
+.result-tabs { flex-wrap: wrap; }
+.redraw-controls { border-top: 1px solid #34444a; margin-top: 12px; padding-top: 12px; }
+#redraw-status, #contact-status { margin-top: 7px; color: #bac8ca; }
+#contact-panel { margin-top: 12px; }
+#contact-panel label { display: block; font-size: 14px; margin: 8px 0; }
+#contact-zoom { width: 100%; max-width: 480px; display: block; margin-top: 8px; background: #101619; }
+#contact-zoom[data-active="true"], #shot[data-contact="true"] { cursor: crosshair; }
+#reviewed-target { margin-top: 8px; }
 @media (max-width: 840px) {
   .workbench { grid-template-columns: minmax(0, 1fr); }
 }

@@ -10,7 +10,6 @@ from tempfile import TemporaryDirectory
 import cv2
 import numpy as np
 
-from defense_review import Review
 from what_if import ROOT, placement_report, composite, project, write_png
 
 
@@ -287,6 +286,7 @@ def build_bundle(destination, review, fixture, entry):
 
 
 def main():
+    from defense_review import Review
     parser = argparse.ArgumentParser(description="Prepare fixed ComfyUI input packs for experiment 5.1.")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--spec", type=Path, default=ROOT / "player_redraw_cases.json")

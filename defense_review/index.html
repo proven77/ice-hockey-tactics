@@ -36,6 +36,7 @@
           <p id="coverage"></p>
           <p id="coverage-detail"></p>
           <button id="suggest" hidden></button>
+          <button id="reviewed-target" hidden>套用已評估落點</button>
         </div>
       </div>
     </article>
@@ -48,13 +49,26 @@
       <div class="info">
         <p id="status" role="status" aria-live="polite">載入案例中</p>
         <button id="retry" hidden>重試修補</button>
+        <div class="redraw-controls">
+          <button id="redraw" disabled>重繪 D1</button>
+          <p id="redraw-status" role="status" aria-live="polite">先拖曳或套用已評估落點，再重繪。</p>
+        </div>
+        <div id="contact-panel" hidden>
+          <button id="contact-mode" aria-pressed="false">標記冰刀接點</button>
+          <label><input id="plausible" type="checkbox"> 已確認人物與冰刀接地合理</label>
+          <button id="contact-clear">接點不清楚，保留待確認</button>
+          <p id="contact-status"></p>
+          <p>黃色十字是指定接點，綠色十字是人工標點。標點以 ±2 px 估計；看不清時請保留待確認。</p>
+          <canvas id="contact-zoom" width="480" height="240" aria-label="冰刀接點放大核對區"></canvas>
+        </div>
       </div>
     </article>
   </section>
   <section class="output" aria-label="結果與匯出">
     <div class="result-tabs" aria-label="比較畫面">
       <button id="original" aria-pressed="true">原圖</button>
-      <button id="result" aria-pressed="false" disabled>What-If</button>
+      <button id="result" aria-pressed="false" disabled>即時預覽</button>
+      <button id="pose-result" aria-pressed="false" disabled>姿態重繪</button>
     </div>
     <div class="exports">
       <button id="save-clean" disabled>乾淨圖 PNG</button>

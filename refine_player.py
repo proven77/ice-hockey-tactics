@@ -16,7 +16,7 @@ import numpy as np
 import requests
 
 from prepare_player_redraw import CONDITION_SIZE, Crop, json_file
-from what_if import ROOT, check_comfy_ready, repair_workflow, write_png
+from what_if import ROOT, check_comfy_ready, repair_workflow, write_png, filesystem_path
 
 
 PROMPT = (
@@ -30,7 +30,8 @@ PROMPT = (
 
 
 def read_image(path, mask=False):
-    result = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE if mask else cv2.IMREAD_COLOR)
+    content = filesystem_path(path).read_bytes()
+    result = cv2.imdecode(np.frombuffer(content, np.uint8), cv2.IMREAD_GRAYSCALE if mask else cv2.IMREAD_COLOR) if content else None
     if result is None:
         raise ValueError(f"Cannot read image: {path}")
     return result
